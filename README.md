@@ -32,19 +32,29 @@ piece to [OpenRouter](https://openrouter.ai) for transcription, then writes a
 
 ## Using it
 
-1. **Pick the file** — drag it onto the window, or use *Browse…*. Supported
-   containers: mp3, wav, m4a, aac, flac, ogg/opus, wma, mp4, mkv, mov, avi,
-   webm, wmv, mpg, ts, 3gp and a few more. Anything ffmpeg can decode works.
+1. **Add files** — drag them onto the window (as many as you like) or use
+   *Add files…*, which accepts a multi-selection. Files are queued in the order
+   you add them; duplicates, folders and non-media files are reported in the log
+   rather than silently dropped. Supported containers: mp3, wav, m4a, aac, flac,
+   ogg/opus, wma, mp4, mkv, mov, avi, webm, wmv, mpg, ts, 3gp and a few more.
+   Anything ffmpeg can decode works.
 2. **Pick a model** — *Change…* opens the list fetched from
    `/api/v1/models`, filtered to models that declare audio input. The list shows
    the price per audio token/hour where the model publishes it. Whisper-family
    models (`openai/whisper-large-v3`, `openai/whisper-1`, …) are the usual
    choice; free variants exist but are rate limited.
-3. **Press Transcribe.** The progress bar covers probing, cutting audio,
-   uploading and writing. *Cancel* stops after the chunk in flight.
+3. **Press Transcribe.** The queue is processed one file at a time. The progress
+   bar covers the whole batch, and the line above it names the file being worked
+   on. A file that fails is marked in the list and the batch continues; *Cancel*
+   stops the batch instead of moving to the next file. Pressing Transcribe again
+   retries whatever did not finish.
 4. **Open results folder** reveals `<name>.srt` and `<name>.txt`. If a
    transcript with that name already exists, the new one is written as
    `<name>-2.srt` instead of overwriting it.
+
+The line beneath the buttons always states why *Transcribe* is unavailable —
+no API key, ffmpeg still downloading, model list not loaded, nothing queued —
+so a grey button never needs guessing at.
 
 Long recordings are split into ~10 minute spans, balanced so the last chunk is
 not a stub, and each boundary snaps to a detected silence so words are not cut
@@ -121,6 +131,7 @@ ffmpeg is installed; to include them, either install ffmpeg or point
 
 | Symptom | Cause |
 | --- | --- |
+| *Transcribe* is grey | The line under the buttons says which requirement is missing. |
 | `TTM_ADDTOOL failed` on start | The exe was built without `app.manifest`. See *The application manifest* above. |
 | Model list is empty | The key was rejected or the network is blocked; the log line says which. |
 | `ffmpeg could not be obtained` | Both mirrors are unreachable. Install ffmpeg manually (`winget install Gyan.FFmpeg`, `scoop install ffmpeg`, or a zip in `C:\ffmpeg\bin`) and restart. |

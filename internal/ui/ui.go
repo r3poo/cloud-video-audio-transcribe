@@ -47,19 +47,29 @@ type app struct {
 	lastStep string
 	lastDir  string
 	fileDir  string
+	queue    queue
+
+	// ffmpegNote and modelsNote explain a failed check. They are only shown
+	// when that check is what blocks the run.
+	ffmpegNote string
+	modelsNote string
 
 	lblFFmpeg   *walk.Label
 	cmbModel    *walk.ComboBox
 	lblModel    *walk.Label
 	btnReload   *walk.PushButton
 	btnPick     *walk.PushButton
-	lineFile    *walk.LineEdit
-	btnBrowse   *walk.PushButton
+	lstQueue    *walk.ListBox
+	lblQueue    *walk.Label
+	btnAdd      *walk.PushButton
+	btnRemove   *walk.PushButton
+	btnClear    *walk.PushButton
 	lineOut     *walk.LineEdit
 	btnOut      *walk.PushButton
 	btnRun      *walk.PushButton
 	btnCancel   *walk.PushButton
 	btnOpen     *walk.PushButton
+	lblReady    *walk.Label
 	progressBar *walk.ProgressBar
 	lblProgress *walk.Label
 	logBox      *walk.TextEdit
@@ -96,12 +106,12 @@ func startupFailureMessage(err error) string {
 func (a *app) build() error {
 	a.loadEnvironment()
 
-	width, height := 780, 660
+	width, height := 800, 760
 	return (declarative.MainWindow{
 		AssignTo: &a.mw,
 		Title:    appName,
 		Size:     declarative.Size{Width: width, Height: height},
-		MinSize:  declarative.Size{Width: 640, Height: 560},
+		MinSize:  declarative.Size{Width: 660, Height: 620},
 		OnDropFiles: func(files []string) {
 			a.acceptDroppedFiles(files)
 		},
@@ -143,18 +153,41 @@ func (a *app) build() error {
 				},
 			},
 			declarative.GroupBox{
-				Title:  "Input file (audio or video)",
-				Layout: declarative.HBox{Spacing: 8},
+				Title:  "Files to transcribe (or drag audio and video onto the window)",
+				Layout: declarative.VBox{Spacing: 6},
 				Children: []declarative.Widget{
-					declarative.LineEdit{
-						AssignTo:      &a.lineFile,
-						ReadOnly:      true,
-						StretchFactor: 1,
+					declarative.ListBox{
+						AssignTo:              &a.lstQueue,
+						StretchFactor:         1,
+						MinSize:               declarative.Size{Height: 120},
+						OnCurrentIndexChanged: a.queueSelectionChanged,
 					},
-					declarative.PushButton{
-						AssignTo:  &a.btnBrowse,
-						Text:      "Browse…",
-						OnClicked: a.pickFile,
+					declarative.Composite{
+						Layout: declarative.HBox{Spacing: 8},
+						Children: []declarative.Widget{
+							declarative.PushButton{
+								AssignTo:  &a.btnAdd,
+								Text:      "Add files…",
+								OnClicked: a.addFiles,
+							},
+							declarative.PushButton{
+								AssignTo:  &a.btnRemove,
+								Text:      "Remove",
+								Enabled:   false,
+								OnClicked: a.removeSelected,
+							},
+							declarative.PushButton{
+								AssignTo:  &a.btnClear,
+								Text:      "Clear",
+								Enabled:   false,
+								OnClicked: a.clearQueue,
+							},
+							declarative.HSpacer{},
+							declarative.Label{
+								AssignTo: &a.lblQueue,
+								Text:     "No files queued",
+							},
+						},
 					},
 				},
 			},
@@ -195,6 +228,10 @@ func (a *app) build() error {
 						OnClicked: a.openResultsFolder,
 					},
 				},
+			},
+			declarative.Label{
+				AssignTo: &a.lblReady,
+				Text:     "Checking ffmpeg, API key and models…",
 			},
 			declarative.Composite{
 				Layout: declarative.HBox{Spacing: 8},
@@ -252,6 +289,8 @@ func (a *app) loadEnvironment() {
 // startup kicks off the two slow checks in the background so the window is
 // interactive immediately.
 func (a *app) startup() {
+	a.refreshQueue()
+	a.refreshReadiness()
 	a.logf("%s ready. ffmpeg, API key and models are being checked.", appName)
 	if a.envPath != "" {
 		a.logf("Settings file: %s", a.envPath)
@@ -276,9 +315,10 @@ func (a *app) prepareFFmpeg() {
 	if install, ok := ffmpeg.Resolve(ctx, exeDir); ok {
 		a.ui(func() {
 			a.install = install
+			a.ffmpegNote = ""
 			a.lblFFmpeg.SetText(install.Describe())
 			a.appendLog("Using " + install.Describe())
-			a.updateRunButton()
+			a.refreshReadiness()
 		})
 		return
 	}
@@ -304,6 +344,9 @@ func (a *app) prepareFFmpeg() {
 		a.ui(func() {
 			a.lblFFmpeg.SetText("ffmpeg unavailable — transcription is disabled")
 			a.appendLog("ffmpeg error: " + err.Error())
+			a.ffmpegNote = "ffmpeg could not be found or downloaded. Install it (winget install Gyan.FFmpeg), " +
+				"or put a static build in ffmpeg\\bin next to the program, or set FFMPEG_PATH."
+			a.refreshReadiness()
 			walk.MsgBox(a.mw, appName,
 				"ffmpeg could not be found or downloaded:\r\n\r\n"+err.Error()+
 					"\r\n\r\nInstall ffmpeg (https://ffmpeg.org/download.html) and restart, "+
@@ -314,9 +357,10 @@ func (a *app) prepareFFmpeg() {
 
 	a.ui(func() {
 		a.install = install
+		a.ffmpegNote = ""
 		a.lblFFmpeg.SetText(install.Describe())
 		a.appendLog("Using " + install.Describe())
-		a.updateRunButton()
+		a.refreshReadiness()
 	})
 }
 
@@ -331,6 +375,7 @@ func (a *app) prepareModels() {
 			a.appendLog("    " + keyAPIKey + "=sk-or-v1-…")
 			a.appendLog("Then restart the program. Get a key from https://openrouter.ai/keys")
 			a.cmbModel.SetModel([]string{"(no API key)"})
+			a.refreshReadiness()
 		})
 		return
 	}
@@ -343,6 +388,8 @@ func (a *app) prepareModels() {
 		a.ui(func() {
 			a.appendLog("Could not load models: " + err.Error())
 			a.cmbModel.SetModel([]string{"(model list unavailable)"})
+			a.modelsNote = "Could not load the model list from OpenRouter: " + firstLine(err.Error())
+			a.refreshReadiness()
 			walk.MsgBox(a.mw, appName, "Could not fetch the model list:\r\n\r\n"+err.Error(), walk.MsgBoxIconWarning)
 		})
 		return
@@ -350,6 +397,7 @@ func (a *app) prepareModels() {
 
 	a.ui(func() {
 		a.models = models
+		a.modelsNote = ""
 		labels := modelLabels(models)
 		_ = a.cmbModel.SetModel(labels)
 
@@ -364,11 +412,14 @@ func (a *app) prepareModels() {
 		}
 		_ = a.cmbModel.SetCurrentIndex(index)
 		a.appendLog(fmt.Sprintf("Loaded %d transcription models.", len(models)))
-		a.updateRunButton()
+		a.refreshReadiness()
 
 		// First run: the requirement is to let the user pick, so show the list.
+		// It is queued rather than called here: a modal dialog opened inside a
+		// Synchronize callback would hold up every other queued update, such as
+		// the ffmpeg check finishing and enabling the Transcribe button.
 		if !remembered {
-			a.pickModelDialog()
+			a.ui(a.pickModelDialog)
 		}
 	})
 }
@@ -392,30 +443,15 @@ func (a *app) describeModel() {
 	index := a.cmbModel.CurrentIndex()
 	if index < 0 || index >= len(a.models) {
 		a.lblModel.SetText(" ")
+		a.refreshReadiness()
 		return
 	}
 	model := a.models[index]
 	a.lblModel.SetText(model.ID + "  ·  " + model.PriceLabel())
+	a.refreshReadiness()
 }
 
 // --- files ----------------------------------------------------------------
-
-func (a *app) pickFile() {
-	dlg := walk.FileDialog{
-		Title:          "Choose an audio or video file",
-		Filter:         mediaFilter(),
-		InitialDirPath: a.fileDir,
-	}
-	accepted, err := dlg.ShowOpen(a.mw)
-	if err != nil {
-		a.logf("File dialog error: %v", err)
-		return
-	}
-	if !accepted {
-		return
-	}
-	a.setInput(dlg.FilePath)
-}
 
 func (a *app) pickOutputDir() {
 	dlg := walk.FileDialog{
@@ -432,64 +468,108 @@ func (a *app) pickOutputDir() {
 	}
 }
 
+// addFiles queues every audio and video file the user selects.
+func (a *app) addFiles() {
+	if a.busy {
+		return
+	}
+	dlg := walk.FileDialog{
+		Title:          "Choose audio or video files",
+		Filter:         mediaFilter(),
+		InitialDirPath: a.fileDir,
+	}
+	accepted, err := dlg.ShowOpenMultiple(a.mw)
+	if err != nil {
+		a.logf("File dialog error: %v", err)
+		return
+	}
+	if !accepted || len(dlg.FilePaths) == 0 {
+		return
+	}
+	a.fileDir = filepath.Dir(dlg.FilePaths[len(dlg.FilePaths)-1])
+	a.enqueue(dlg.FilePaths)
+}
+
+// acceptDroppedFiles queues everything dragged onto the window.
 func (a *app) acceptDroppedFiles(files []string) {
 	if a.busy || len(files) == 0 {
 		return
 	}
-	a.setInput(files[0])
-	if len(files) > 1 {
-		a.appendLog(fmt.Sprintf("Dropped %d files; using %s. Transcribe the others one at a time.", len(files), filepath.Base(files[0])))
-	}
+	a.enqueue(files)
 }
 
-func (a *app) setInput(path string) {
-	if path == "" {
+// enqueue adds paths to the queue, logging what was rejected and why rather
+// than dropping it silently.
+func (a *app) enqueue(paths []string) {
+	added, skipped := a.queue.add(paths)
+	for _, s := range skipped {
+		a.appendLog(fmt.Sprintf("Skipped %s: %s", filepath.Base(s.path), s.reason))
+	}
+	if added > 0 {
+		a.appendLog(fmt.Sprintf("Queued %d file(s); %s.", added, a.queue.summary()))
+	}
+	a.refreshQueue()
+	a.refreshReadiness()
+}
+
+func (a *app) removeSelected() {
+	if a.busy {
 		return
 	}
-	a.fileDir = filepath.Dir(path)
-	_ = a.lineFile.SetText(path)
-	a.appendLog("Selected: " + path)
-	a.updateRunButton()
+	index := a.lstQueue.CurrentIndex()
+	item := a.queue.at(index)
+	if item == nil {
+		return
+	}
+	if a.queue.removeAt(index) {
+		a.appendLog("Removed " + filepath.Base(item.path))
+	}
+	a.refreshQueue()
+	a.refreshReadiness()
+}
+
+func (a *app) clearQueue() {
+	if a.busy || a.queue.len() == 0 {
+		return
+	}
+	a.queue.clear()
+	a.appendLog("Cleared the queue.")
+	a.refreshQueue()
+	a.refreshReadiness()
 }
 
 // --- running --------------------------------------------------------------
+
+// target is one queued file, snapshotted on the UI thread before the worker
+// goroutine starts, so the goroutine never touches the queue itself.
+type target struct {
+	index int
+	path  string
+}
 
 func (a *app) startRun() {
 	if a.busy {
 		return
 	}
-	input := strings.TrimSpace(a.lineFile.Text())
-	if input == "" {
-		walk.MsgBox(a.mw, appName, "Choose an audio or video file first (or drag one onto the window).", walk.MsgBoxIconInformation)
-		return
-	}
-	if _, err := os.Stat(input); err != nil {
-		walk.MsgBox(a.mw, appName, "The selected file cannot be read:\r\n\r\n"+err.Error(), walk.MsgBoxIconWarning)
-		return
-	}
-	if a.install == nil {
-		walk.MsgBox(a.mw, appName, "ffmpeg is not ready yet. Wait for the download to finish, or install ffmpeg and restart.", walk.MsgBoxIconWarning)
-		return
-	}
-	index := a.cmbModel.CurrentIndex()
-	if index < 0 || index >= len(a.models) {
-		walk.MsgBox(a.mw, appName, "Pick a transcription model from the list first.", walk.MsgBoxIconWarning)
+	if state := a.readiness(); !state.ready {
+		walk.MsgBox(a.mw, appName, state.reason, walk.MsgBoxIconInformation)
 		return
 	}
 
-	opts := transcribe.Options{
-		Model:     a.models[index].ID,
-		OutputDir: strings.TrimSpace(a.lineOut.Text()),
-		Language:  a.env.Get("TRANSCRIBE_LANGUAGE"),
-	}
-	if raw := a.env.Get(keyChunkSize); raw != "" {
-		if seconds, err := strconv.ParseFloat(raw, 64); err == nil {
-			opts.ChunkSeconds = seconds
+	var targets []target
+	for _, index := range a.queue.pending() {
+		if item := a.queue.at(index); item != nil {
+			targets = append(targets, target{index: index, path: item.path})
 		}
 	}
-	if opts.OutputDir == "" {
-		opts.OutputDir = a.env.Get(keyOutputDir)
+	if len(targets) == 0 {
+		walk.MsgBox(a.mw, appName,
+			"Every queued file has already been transcribed.\r\n\r\nAdd more files, or clear the queue to start over.",
+			walk.MsgBoxIconInformation)
+		return
 	}
+
+	opts := a.options()
 
 	// Remember the model and the output folder for the next run.
 	a.remember(keyModel, opts.Model)
@@ -502,22 +582,125 @@ func (a *app) startRun() {
 	a.started = time.Now()
 	a.lastStep = ""
 	a.setBusy(true)
-	a.appendLog("Starting transcription with " + opts.Model)
+	a.appendLog(fmt.Sprintf("Starting %d file(s) with %s", len(targets), opts.Model))
 
 	install := a.install
 	client := a.client
 	go func() {
 		defer cancel()
+		a.runQueue(ctx, targets, opts, install, client)
+	}()
+}
+
+// options collects the settings for a run from the window and the .env file.
+func (a *app) options() transcribe.Options {
+	opts := transcribe.Options{
+		OutputDir: strings.TrimSpace(a.lineOut.Text()),
+		Language:  a.env.Get("TRANSCRIBE_LANGUAGE"),
+	}
+	if model := a.selectedModel(); model != nil {
+		opts.Model = model.ID
+	}
+	if raw := a.env.Get(keyChunkSize); raw != "" {
+		if seconds, err := strconv.ParseFloat(raw, 64); err == nil {
+			opts.ChunkSeconds = seconds
+		}
+	}
+	if opts.OutputDir == "" {
+		opts.OutputDir = a.env.Get(keyOutputDir)
+	}
+	return opts
+}
+
+func (a *app) selectedModel() *openrouter.Model {
+	index := a.cmbModel.CurrentIndex()
+	if index < 0 || index >= len(a.models) {
+		return nil
+	}
+	return &a.models[index]
+}
+
+// runQueue transcribes the files one after another. A failure is recorded and
+// the queue continues, so one unreadable file does not cost the rest of the
+// batch; cancelling stops the run instead of moving to the next file.
+func (a *app) runQueue(ctx context.Context, targets []target, opts transcribe.Options, install *ffmpeg.Install, client *openrouter.Client) {
+	total := len(targets)
+
+	defer func() {
+		a.ui(a.finishQueue)
+	}()
+
+	for position, item := range targets {
+		if ctx.Err() != nil {
+			return
+		}
+		index, path := item.index, item.path
+
+		a.ui(func() { a.markItem(index, statusRunning, "") })
+
 		job := &transcribe.Job{
 			FFmpeg: install,
 			Client: client,
 			Progress: func(p transcribe.Progress) {
-				a.ui(func() { a.showProgress(p) })
+				overall := (float64(position) + clampFraction(p.Fraction)) / float64(total)
+				a.ui(func() { a.showProgress(p, position+1, total, overall) })
 			},
 		}
-		result, err := job.Run(ctx, transcribe.Input{Path: input}, opts)
-		a.ui(func() { a.finishRun(result, err) })
-	}()
+
+		result, err := job.Run(ctx, transcribe.Input{Path: path}, opts)
+		switch {
+		case err == nil:
+			a.ui(func() { a.markDone(index, result) })
+		case errors.Is(err, context.Canceled):
+			a.ui(func() {
+				a.markItem(index, statusCancelled, "cancelled")
+				a.appendLog("Cancelled " + filepath.Base(path))
+			})
+			return
+		default:
+			errText := err.Error()
+			a.ui(func() {
+				a.markItem(index, statusFailed, firstLine(errText))
+				a.appendLog(fmt.Sprintf("Failed %s: %s", filepath.Base(path), errText))
+				var apiErr *openrouter.APIError
+				if errors.As(err, &apiErr) {
+					if hint := apiErr.HumanHint(); hint != "" {
+						a.appendLog(hint)
+					}
+				}
+			})
+		}
+	}
+}
+
+func (a *app) markItem(index int, status itemStatus, note string) {
+	a.queue.setStatus(index, status, note)
+	a.refreshQueue()
+}
+
+// markDone records one successful file and makes its output reachable.
+func (a *app) markDone(index int, result *transcribe.Result) {
+	a.markItem(index, statusDone, fmt.Sprintf("%d cues · %s", result.Segments, filepath.Base(result.SRTPath)))
+	a.lastDir = filepath.Dir(result.SRTPath)
+	a.btnOpen.SetEnabled(true)
+	a.appendLog("Wrote " + result.SRTPath)
+	a.appendLog("Wrote " + result.TextPath)
+	a.appendLog(fmt.Sprintf("Transcribed %s in %d part(s), %d cues%s",
+		humanDuration(result.Duration), result.Spans, result.Segments, costSuffix(result.CostUSD)))
+	if len(result.Failed) > 0 {
+		a.appendLog(fmt.Sprintf("Warning: %d part(s) of %s failed and are missing from the output.",
+			len(result.Failed), filepath.Base(result.SRTPath)))
+	}
+}
+
+func clampFraction(f float64) float64 {
+	if f < 0 {
+		return 0
+	}
+	if f > 1 {
+		return 1
+	}
+	return f
 }
 
 func (a *app) requestCancel() {
@@ -529,69 +712,44 @@ func (a *app) requestCancel() {
 	a.btnCancel.SetEnabled(false)
 }
 
-func (a *app) showProgress(p transcribe.Progress) {
+func (a *app) showProgress(p transcribe.Progress, fileNo, files int, overall float64) {
 	if p.Message != "" && p.Message != a.lastStep {
 		a.appendLog(p.Message)
 		a.lastStep = p.Message
 	}
-	percent := int(p.Fraction * 100)
-	if percent < 0 {
-		percent = 0
-	}
-	if percent > 100 {
-		percent = 100
-	}
+	percent := int(clampFraction(overall) * 100)
 	a.progressBar.SetValue(percent)
-	label := p.Message
-	if p.Total > 1 {
-		label = fmt.Sprintf("%d%%  (%d of %d parts)", percent, p.Done+1, p.Total)
-	}
-	a.lblProgress.SetText(label)
+	a.lblProgress.SetText(fmt.Sprintf("File %d of %d — %d%% — %s", fileNo, files, percent, p.Message))
 }
 
-func (a *app) finishRun(result *transcribe.Result, err error) {
+// finishQueue reports how the batch went and re-enables the window.
+func (a *app) finishQueue() {
 	a.setBusy(false)
 	a.cancel = nil
 
-	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			a.appendLog("Cancelled. No files were written.")
-			a.lblProgress.SetText("Cancelled")
-			a.progressBar.SetValue(0)
-			return
-		}
-		a.appendLog("Failed: " + err.Error())
-		a.lblProgress.SetText("Failed")
-		a.progressBar.SetValue(0)
-		message := err.Error()
-		var apiErr *openrouter.APIError
-		if errors.As(err, &apiErr) {
-			if hint := apiErr.HumanHint(); hint != "" {
-				message = hint + "\r\n\r\n" + apiErr.Error()
-			}
-		}
-		walk.MsgBox(a.mw, appName, message, walk.MsgBoxIconError)
-		return
-	}
-
+	done, failedCount, waiting := a.queue.counts()
 	elapsed := time.Since(a.started).Round(time.Second)
-	a.progressBar.SetValue(100)
-	a.lblProgress.SetText(fmt.Sprintf("Done in %s — %d cues", elapsed, result.Segments))
-	a.appendLog(fmt.Sprintf("Wrote %s", result.SRTPath))
-	a.appendLog(fmt.Sprintf("Wrote %s", result.TextPath))
-	a.appendLog(fmt.Sprintf("Transcribed %s in %d part(s), %d cues%s",
-		humanDuration(result.Duration), result.Spans, result.Segments, costSuffix(result.CostUSD)))
-	if len(result.Failed) > 0 {
-		a.appendLog(fmt.Sprintf("Warning: %d part(s) failed and are missing from the output.", len(result.Failed)))
+
+	switch {
+	case waiting > 0:
+		a.lblProgress.SetText(fmt.Sprintf("Stopped — %d of %d file(s) done", done, done+failedCount+waiting))
+		a.appendLog(fmt.Sprintf("Stopped after %s: %d done, %d failed, %d not attempted.",
+			elapsed, done, failedCount, waiting))
+	case failedCount > 0:
+		a.progressBar.SetValue(100)
+		a.lblProgress.SetText(fmt.Sprintf("Finished in %s — %d done, %d failed", elapsed, done, failedCount))
+		a.appendLog(fmt.Sprintf("Finished in %s: %d file(s) done, %d failed.", elapsed, done, failedCount))
+	default:
+		a.progressBar.SetValue(100)
+		a.lblProgress.SetText(fmt.Sprintf("Done in %s — %d file(s)", elapsed, done))
+		a.appendLog(fmt.Sprintf("Finished %d file(s) in %s.", done, elapsed))
 	}
 
-	a.lastDir = filepath.Dir(result.SRTPath)
-	a.btnOpen.SetEnabled(true)
-
-	if len(result.Failed) > 0 {
+	if failedCount > 0 {
 		walk.MsgBox(a.mw, appName,
-			fmt.Sprintf("The transcript was written, but %d part(s) of the recording could not be transcribed.\r\n\r\n%s",
-				len(result.Failed), result.SRTPath), walk.MsgBoxIconWarning)
+			fmt.Sprintf("%d of %d file(s) could not be transcribed:\r\n\r\n%s",
+				failedCount, done+failedCount+waiting, a.queue.failureSummary()),
+			walk.MsgBoxIconWarning)
 	}
 }
 
@@ -624,24 +782,85 @@ func (a *app) appendLog(line string) {
 
 func (a *app) setBusy(busy bool) {
 	a.busy = busy
-	a.btnBrowse.SetEnabled(!busy)
+	a.btnAdd.SetEnabled(!busy)
 	a.btnOut.SetEnabled(!busy)
 	a.btnReload.SetEnabled(!busy)
 	a.btnPick.SetEnabled(!busy && len(a.models) > 0)
 	a.btnCancel.SetEnabled(busy)
 	a.cmbModel.SetEnabled(!busy)
-	a.lineFile.SetEnabled(!busy)
 	a.lineOut.SetEnabled(!busy)
+	a.lstQueue.SetEnabled(!busy)
 	if busy {
 		a.progressBar.SetValue(0)
 		a.lblProgress.SetText("Starting…")
 	}
-	a.updateRunButton()
+	a.refreshQueue()
+	a.refreshReadiness()
 }
 
-func (a *app) updateRunButton() {
-	ready := !a.busy && a.install != nil && len(a.models) > 0 && a.client != nil
-	a.btnRun.SetEnabled(ready)
+// refreshQueue redraws the file list and the buttons that act on it.
+func (a *app) refreshQueue() {
+	selected := a.lstQueue.CurrentIndex()
+	_ = a.lstQueue.SetModel(a.queue.labels())
+	if n := a.queue.len(); selected >= n {
+		selected = n - 1
+	}
+	if selected >= 0 {
+		_ = a.lstQueue.SetCurrentIndex(selected)
+	}
+	a.lblQueue.SetText(a.queue.summary())
+	a.queueSelectionChanged()
+	a.btnClear.SetEnabled(!a.busy && a.queue.len() > 0)
+}
+
+// queueSelectionChanged only reacts to the selected row. It must not replace the
+// model, because SetModel resets the selection and would re-enter this handler.
+func (a *app) queueSelectionChanged() {
+	a.btnRemove.SetEnabled(!a.busy && a.lstQueue.CurrentIndex() >= 0)
+	a.refreshReadiness()
+}
+
+// readiness reports whether a run can start and what is missing if it cannot.
+func (a *app) readiness() readiness {
+	return evaluateReadiness(readinessInput{
+		hasKey:     a.client != nil,
+		hasFFmpeg:  a.install != nil,
+		modelCount: len(a.models),
+		modelIndex: a.cmbModel.CurrentIndex(),
+		busy:       a.busy,
+		queueLen:   a.queue.len(),
+		pendingLen: len(a.queue.pending()),
+	})
+}
+
+// refreshReadiness keeps the Transcribe button and the line beneath it in sync.
+// The line always names what is missing, so a disabled button explains itself.
+func (a *app) refreshReadiness() {
+	state := a.readiness()
+	a.btnRun.SetEnabled(state.ready)
+
+	if a.busy {
+		a.lblReady.SetText("Transcribing…")
+		return
+	}
+	if state.ready {
+		name := "the selected model"
+		if model := a.selectedModel(); model != nil {
+			name = model.ID
+		}
+		a.lblReady.SetText(fmt.Sprintf("Ready: %d file(s) will be transcribed with %s.", a.queue.len(), name))
+		return
+	}
+
+	// A check that failed says so, instead of reporting that it is still running.
+	reason := state.reason
+	switch {
+	case a.install == nil && a.ffmpegNote != "":
+		reason = a.ffmpegNote
+	case len(a.models) == 0 && a.client != nil && a.modelsNote != "":
+		reason = a.modelsNote
+	}
+	a.lblReady.SetText(reason)
 }
 
 // remember stores a setting so the next run starts where this one left off.

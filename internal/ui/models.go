@@ -103,5 +103,5 @@ func (a *app) pickModelDialog() {
 	model := a.models[index]
 	a.remember(keyModel, model.ID)
 	a.appendLog("Model set to " + model.ID)
-	a.updateRunButton()
+	a.refreshReadiness()
 }
