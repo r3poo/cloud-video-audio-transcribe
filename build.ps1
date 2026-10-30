@@ -17,12 +17,11 @@ try {
     # ("TTM_ADDTOOL failed"), so fail here instead of on the user's machine.
     $ascii = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($full))
     if ($ascii -notlike '*Microsoft.Windows.Common-Controls*') {
-        throw @"
-        $Output has no application manifest, so it cannot show a window.
-        app_windows_amd64.syso is missing from the project root. Regenerate it:
-            go install github.com/akavel/rsrc@latest
-            rsrc -manifest app.manifest -arch amd64 -o app_windows_amd64.syso
-        "@
+        Write-Host "Build failed: $Output has no application manifest, so it cannot show a window." -ForegroundColor Red
+        Write-Host "app_windows_amd64.syso is missing from the project root. Regenerate it:" -ForegroundColor Red
+        Write-Host "    go install github.com/akavel/rsrc@latest" -ForegroundColor Red
+        Write-Host "    rsrc -manifest app.manifest -arch amd64 -o app_windows_amd64.syso" -ForegroundColor Red
+        exit 1
     }
 
     $size = [math]::Round((Get-Item $full).Length / 1MB, 1)
