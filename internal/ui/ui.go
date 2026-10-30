@@ -830,6 +830,7 @@ func (a *app) readiness() readiness {
 		busy:       a.busy,
 		queueLen:   a.queue.len(),
 		pendingLen: len(a.queue.pending()),
+		envPath:    a.envPath,
 	})
 }
 

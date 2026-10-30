@@ -269,6 +269,9 @@ type readinessInput struct {
 	busy       bool
 	queueLen   int
 	pendingLen int
+	// envPath is the .env file the program reads and writes, so the message can
+	// name the exact file the key belongs in.
+	envPath string
 }
 
 // evaluateReadiness decides whether a run can start. The checks are ordered so
@@ -279,6 +282,9 @@ func evaluateReadiness(in readinessInput) readiness {
 	case in.busy:
 		return readiness{false, "Transcribing…"}
 	case !in.hasKey:
+		if in.envPath != "" {
+			return readiness{false, "No API key. Put OPENROUTER_API_KEY=sk-or-v1-… in " + in.envPath + " and restart."}
+		}
 		return readiness{false, "No API key. Put OPENROUTER_API_KEY=sk-or-v1-… in the .env file next to the program, then restart."}
 	case !in.hasFFmpeg:
 		return readiness{false, "Waiting for ffmpeg: it is being located or downloaded."}

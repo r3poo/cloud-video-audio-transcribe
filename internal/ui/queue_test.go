@@ -217,6 +217,15 @@ func TestEvaluateReadinessNamesTheMissingPiece(t *testing.T) {
 }
 
 // A run in progress must not report a missing requirement as the reason.
+// The missing-key message must name the file the key belongs in, because
+// "the .env file" is not obvious when the program is launched from Explorer.
+func TestReadinessNamesTheEnvFileForAMissingKey(t *testing.T) {
+	got := evaluateReadiness(readinessInput{envPath: `C:\\Tools\\cloud-transcribe\\.env`})
+	if got.ready || !strings.Contains(got.reason, `C:\\Tools\\cloud-transcribe\\.env`) {
+		t.Fatalf("reason = %q, want it to name the .env path", got.reason)
+	}
+}
+
 func TestEvaluateReadinessPrefersBusyOverMissingInputs(t *testing.T) {
 	got := evaluateReadiness(readinessInput{busy: true})
 	if got.ready {
