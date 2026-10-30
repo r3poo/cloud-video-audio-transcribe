@@ -70,11 +70,27 @@ type app struct {
 func Run() {
 	a := &app{}
 	if err := a.build(); err != nil {
-		walk.MsgBox(nil, appName, "Could not start the window:\r\n\r\n"+err.Error(), walk.MsgBoxIconError)
+		walk.MsgBox(nil, appName, startupFailureMessage(err), walk.MsgBoxIconError)
 		os.Exit(1)
 	}
 	a.startup()
 	a.mw.Run()
+}
+
+// startupFailureMessage turns a window-creation error into something the user
+// can act on. The one worth spelling out is TTM_ADDTOOL: walk registers every
+// widget with a tooltip control, and that fails when the executable was linked
+// without the Common Controls 6 manifest, so no window can be built at all.
+func startupFailureMessage(err error) string {
+	msg := "Could not start the window:\r\n\r\n" + err.Error()
+	if strings.Contains(err.Error(), "TTM_ADDTOOL") || strings.Contains(err.Error(), "ADDTOOL") {
+		msg += "\r\n\r\nThis executable was built without its application manifest, so Windows " +
+			"does not activate Common Controls 6.0.\r\n\r\n" +
+			"Rebuild it from the project root so app_windows_amd64.syso is linked in " +
+			"(see README, Building), or drop app.manifest next to the exe as " +
+			"cloud-transcribe.exe.manifest."
+	}
+	return msg
 }
 
 func (a *app) build() error {

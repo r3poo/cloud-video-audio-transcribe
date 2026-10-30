@@ -85,11 +85,48 @@ Go 1.24 or newer:
 go build -trimpath -ldflags "-H windowsgui -s -w" -o cloud-transcribe.exe .
 ```
 
-`-H windowsgui` hides the console window. `.\build.ps1` runs the same command.
+`-H windowsgui` hides the console window. `.\build.ps1` runs the same command
+and then checks that the result is usable.
+
+### The application manifest
+
+`app.manifest` must be linked into the exe, because walk (like any Common
+Controls 6 program) needs it to activate the newer control library. Without it
+the window never opens and the program reports `TTM_ADDTOOL failed`. Go links it
+through the generated resource objects in the project root:
+
+```
+app_windows_amd64.syso
+app_windows_arm64.syso
+```
+
+They are committed, so a plain `go build` is enough. If you edit `app.manifest`,
+regenerate them:
+
+```powershell
+go install github.com/akavel/rsrc@latest
+rsrc -manifest app.manifest -arch amd64 -o app_windows_amd64.syso
+rsrc -manifest app.manifest -arch arm64 -o app_windows_arm64.syso
+```
+
+`go test .` checks that the manifest and the resource objects agree, and
+`build.ps1` checks the finished exe, so a build that would fail at startup is
+caught before it reaches you.
 
 Tests: `go test ./...`. The ffmpeg integration tests skip themselves when no
 ffmpeg is installed; to include them, either install ffmpeg or point
 `FFMPEG_PATH` at a static build.
+
+## Troubleshooting
+
+| Symptom | Cause |
+| --- | --- |
+| `TTM_ADDTOOL failed` on start | The exe was built without `app.manifest`. See *The application manifest* above. |
+| Model list is empty | The key was rejected or the network is blocked; the log line says which. |
+| `ffmpeg could not be obtained` | Both mirrors are unreachable. Install ffmpeg manually (`winget install Gyan.FFmpeg`, `scoop install ffmpeg`, or a zip in `C:\ffmpeg\bin`) and restart. |
+| `no audio stream` | The file is video-only or the container is broken; check that it plays elsewhere. |
+| Empty transcript | The chosen model does not really support audio, even if it advertises it. Pick a Whisper model. |
+| `400`/`422` from the API | A chunk was rejected, usually a rate limit or size limit. The span is logged and skipped; lower `TRANSCRIBE_CHUNK_SECONDS` if it repeats. |
 
 ## How it works
 
