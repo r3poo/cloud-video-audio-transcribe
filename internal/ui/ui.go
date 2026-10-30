@@ -323,22 +323,47 @@ func (a *app) prepareFFmpeg() {
 		return
 	}
 
-	a.logf("No local ffmpeg found. Downloading a static Windows build (about 115 MB)…")
-	var lastReport time.Time
+	a.logf("No local ffmpeg found. Downloading a static Windows build…")
+	if dir, err := ffmpeg.CacheDir(); err == nil {
+		a.logf("ffmpeg will be installed in %s (ffmpeg-download.zip appears there while it downloads)", dir)
+	}
+	var lastReport, lastLog time.Time
+	var lastSource string
 	install, err := ffmpeg.Ensure(ctx, exeDir, func(p ffmpeg.Progress) {
-		if p.Stage != "downloading" {
+		switch p.Stage {
+		case "requesting":
+			if p.Source != lastSource {
+				lastSource = p.Source
+				a.logf("Contacting %s…", p.Source)
+			}
+			a.ui(func() { a.lblFFmpeg.SetText("Asking " + p.Source + " for ffmpeg…") })
+			return
+		case "extracting", "verifying":
 			a.logf("ffmpeg: %s (%s)", p.Stage, p.Source)
+			a.ui(func() { a.lblFFmpeg.SetText("Installing ffmpeg: " + p.Stage + "…") })
 			return
 		}
-		if time.Since(lastReport) < 700*time.Millisecond {
-			return
-		}
-		lastReport = time.Now()
-		text := fmt.Sprintf("Downloading ffmpeg from %s: %.1f MB", p.Source, float64(p.Downloaded)/1e6)
+
+		text := fmt.Sprintf("Downloading ffmpeg from %s: %s", p.Source, ffmpeg.HumanBytes(p.Downloaded))
 		if p.Total > 0 {
-			text = fmt.Sprintf("Downloading ffmpeg from %s: %.1f / %.1f MB", p.Source, float64(p.Downloaded)/1e6, float64(p.Total)/1e6)
+			text += " / " + ffmpeg.HumanBytes(p.Total)
 		}
-		a.ui(func() { a.lblFFmpeg.SetText(text) })
+		text += " at " + ffmpeg.HumanRate(p.Speed)
+		if p.Total > 0 && p.Speed > 0 {
+			if left := time.Duration(float64(p.Total-p.Downloaded)/float64(p.Speed)) * time.Second; left > 0 {
+				text += fmt.Sprintf(", about %s left", left.Round(time.Second))
+			}
+		}
+
+		if time.Since(lastReport) >= 700*time.Millisecond {
+			lastReport = time.Now()
+			a.ui(func() { a.lblFFmpeg.SetText(text) })
+		}
+		// One log line every few seconds is enough to prove it is moving.
+		if time.Since(lastLog) >= 10*time.Second {
+			lastLog = time.Now()
+			a.logf("%s", text)
+		}
 	})
 	if err != nil {
 		a.ui(func() {

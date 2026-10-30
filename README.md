@@ -132,6 +132,7 @@ ffmpeg is installed; to include them, either install ffmpeg or point
 | Symptom | Cause |
 | --- | --- |
 | *Transcribe* is grey | The line under the buttons says which requirement is missing. |
+| ffmpeg download crawls or seems stuck | It fell back to www.gyan.dev after both GitHub mirrors failed; the status line shows the source and rate, and the source is dropped after 30 s if it stays under 120 KB/s. Check *Contacting…* lines in the log. |
 | `TTM_ADDTOOL failed` on start | The exe was built without `app.manifest`. See *The application manifest* above. |
 | Model list is empty | The key was rejected or the network is blocked; the log line says which. |
 | `ffmpeg could not be obtained` | Both mirrors are unreachable. Install ffmpeg manually (`winget install Gyan.FFmpeg`, `scoop install ffmpeg`, or a zip in `C:\ffmpeg\bin`) and restart. |
@@ -164,3 +165,31 @@ Design notes:
   `verbose_json` segments, which is what the audio-transcription endpoint
   accepts for base64 audio. Fallbacks cover providers that answer with plain
   JSON or wrap the payload in `{"data": …}`.
+
+## How ffmpeg is obtained
+
+An existing install always wins; the program never downloads over one it can
+use. The search order is `FFMPEG_PATH`, `ffmpeg.exe` next to the program and in
+`ffmpeg\bin`, then `PATH`, then `%LOCALAPPDATA%\cloudtranscribe\ffmpeg`.
+
+Only when none of those exists does it download a static build, trying three
+hosts in order and keeping the first that answers:
+
+| Host | Archive | Measured here |
+| --- | --- | --- |
+| gyan.dev build, mirrored on GitHub | ~118 MB | 5 MB/s |
+| BtbN/FFmpeg-Builds (GitHub) | ~200 MB | 11 MB/s |
+| www.gyan.dev directly | ~118 MB | 68 KB/s |
+
+gyan.dev is listed on ffmpeg.org and is authoritative, but it throttles single
+connections to tens of kilobytes per second — half an hour for the same file.
+That is why the fast mirrors come first and the direct host last.
+
+A source is abandoned instead of being waited on: after 30 s with an average
+rate under 120 KB/s (too slow), or after 30 s with no bytes at all (stalled).
+The next source is tried and the failure is logged. The archive is written to
+`ffmpeg-download.zip` in the install folder so a slow transfer is visible in
+Explorer, and it is deleted once `ffmpeg.exe` and `ffprobe.exe` are extracted.
+
+Transcribed media never touches the disk: chunks are cut and uploaded from
+memory.

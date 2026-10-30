@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // buildZip renders an in-memory archive that mirrors the layout of the
@@ -227,4 +229,160 @@ func TestDownloadReportsEveryFailure(t *testing.T) {
 			t.Errorf("error does not mention %q: %v", want, err)
 		}
 	}
+}
+
+func TestGithubReleaseAssetPicksTheMatchingAsset(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/repos/GyanD/codexffmpeg/releases/latest"; got != want {
+			t.Errorf("path = %q, want %q", got, want)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"assets":[
+			{"name":"ffmpeg-2026-10-29-git-31ba826726-essentials_build.7z","browser_download_url":"https://example.invalid/a.7z"},
+			{"name":"ffmpeg-2026-10-29-git-31ba826726-full_build.zip","browser_download_url":"https://example.invalid/full.zip"},
+			{"name":"ffmpeg-2026-10-29-git-31ba826726-essentials_build.zip","browser_download_url":"https://example.invalid/essentials.zip"}
+		]}`))
+	}))
+	defer srv.Close()
+
+	withGithubAPI(t, srv.URL)
+
+	got, err := githubReleaseAsset(context.Background(), githubReleaseGyan, "-essentials_build.zip")
+	if err != nil {
+		t.Fatalf("githubReleaseAsset: %v", err)
+	}
+	if got != "https://example.invalid/essentials.zip" {
+		t.Fatalf("url = %q, want the essentials archive", got)
+	}
+}
+
+func TestGithubReleaseAssetExplainsAMissingAsset(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"assets":[{"name":"ffmpeg-linux.tar.xz","browser_download_url":"https://example.invalid/l"}]}`))
+	}))
+	defer srv.Close()
+
+	withGithubAPI(t, srv.URL)
+
+	_, err := githubReleaseAsset(context.Background(), githubReleaseGyan, "-essentials_build.zip")
+	if err == nil || !strings.Contains(err.Error(), "essentials_build.zip") {
+		t.Fatalf("err = %v, want it to name the asset that is missing", err)
+	}
+}
+
+// A host that dribbles bytes must be abandoned rather than waited on: this is
+// the gyan.dev-at-52KB/s case that looked like a hang to the user.
+func TestDownloadAbandonsASlowSource(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(1<<20))
+		flusher, _ := w.(http.Flusher)
+		chunk := make([]byte, 8<<10)
+		for i := 0; i < 8; i++ {
+			w.Write(chunk)
+			if flusher != nil {
+				flusher.Flush()
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+	}))
+	defer srv.Close()
+
+	restore := slowRules(50*time.Millisecond, 50<<20)
+	defer restore()
+
+	_, err := downloadFrom(context.Background(), Source{Name: "throttled", URL: srv.URL}, t.TempDir(), nil)
+	if !errors.Is(err, errTooSlow) {
+		t.Fatalf("err = %v, want errTooSlow", err)
+	}
+	if !strings.Contains(err.Error(), "/s") {
+		t.Errorf("err = %v, want it to report the measured rate", err)
+	}
+}
+
+func TestDownloadAbandonsAStalledSource(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(1<<20))
+		w.Write([]byte("PK"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		select {
+		case <-release:
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	restore := slowRules(time.Hour, 0) // only the stall timer may fire
+	defer restore()
+	withStallTimeout(t, 120*time.Millisecond)
+
+	_, err := downloadFrom(context.Background(), Source{Name: "silent", URL: srv.URL}, t.TempDir(), nil)
+	if !errors.Is(err, errStalled) {
+		t.Fatalf("err = %v, want errStalled", err)
+	}
+}
+
+func TestDownloadRejectsATruncatedBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(64<<10))
+		w.Write([]byte("PK\x03\x04 not the whole archive"))
+	}))
+	defer srv.Close()
+
+	restore := slowRules(time.Hour, 0)
+	defer restore()
+
+	_, err := downloadFrom(context.Background(), Source{Name: "cut", URL: srv.URL}, t.TempDir(), nil)
+	if err == nil || !strings.Contains(err.Error(), "interrupted") {
+		t.Fatalf("err = %v, want a truncated transfer to be reported", err)
+	}
+}
+
+func TestHumanBytesAndRate(t *testing.T) {
+	sizes := map[int64]string{
+		512:         "512 B",
+		1500:        "1.5 KB",
+		117_600_000: "117.6 MB",
+		9_066_944:   "9.1 MB",
+	}
+	for in, want := range sizes {
+		if got := HumanBytes(in); got != want {
+			t.Errorf("HumanBytes(%d) = %q, want %q", in, got, want)
+		}
+	}
+	if got := HumanRate(9_066_944); got != "9.1 MB/s" {
+		t.Errorf("HumanRate = %q, want %q", got, "9.1 MB/s")
+	}
+	if got := HumanRate(0); got != "no data" {
+		t.Errorf("HumanRate(0) = %q, want %q", got, "no data")
+	}
+	if got := shortDuration(95 * time.Second); got != "1m35s" {
+		t.Errorf("shortDuration = %q, want %q", got, "1m35s")
+	}
+}
+
+// withGithubAPI points the release lookup at a local server for one test.
+func withGithubAPI(t *testing.T, base string) {
+	t.Helper()
+	old := githubAPIBase
+	githubAPIBase = base
+	t.Cleanup(func() { githubAPIBase = old })
+}
+
+// slowRules shrinks the throughput thresholds for one test.
+func slowRules(after time.Duration, minimum int64) func() {
+	oldAfter, oldMin := slowAfter, slowMinimum
+	slowAfter, slowMinimum = after, minimum
+	return func() { slowAfter, slowMinimum = oldAfter, oldMin }
+}
+
+// withStallTimeout shrinks the stall watchdog for one test.
+func withStallTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := stallTimeout
+	stallTimeout = d
+	t.Cleanup(func() { stallTimeout = old })
 }

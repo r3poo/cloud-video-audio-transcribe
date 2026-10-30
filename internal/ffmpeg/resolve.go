@@ -212,6 +212,8 @@ type Progress struct {
 	Stage      string // "requesting", "downloading", "extracting", "verifying"
 	Downloaded int64
 	Total      int64
+	// Speed is the average throughput in bytes per second while downloading.
+	Speed int64
 }
 
 // ProgressFunc receives download progress updates.
