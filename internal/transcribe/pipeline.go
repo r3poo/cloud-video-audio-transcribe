@@ -99,6 +99,9 @@ type Result struct {
 	// AudioFormat is the container the provider accepted, which is worth
 	// remembering: the next run can start with it.
 	AudioFormat string
+	// TimestampsEstimated is set when the provider refused timestamped output,
+	// so cue times were spaced by text length instead of being measured.
+	TimestampsEstimated bool
 	// Failed lists spans that could not be transcribed. Results are still
 	// written so a long job is not lost to one bad request.
 	Failed []chunk.Span
@@ -180,6 +183,9 @@ func (j *Job) Run(ctx context.Context, input Input, opts Options) (*Result, erro
 	// next, so a rejection costs one retry for the whole job rather than one per
 	// chunk.
 	preferred := opts.FirstFormat
+	// verbose does the same for the response shape, which a model may refuse
+	// independently of the audio.
+	verbose := true
 
 	for idx, span := range spans {
 		if err := ctx.Err(); err != nil {
@@ -191,7 +197,7 @@ func (j *Job) Run(ctx context.Context, input Input, opts Options) (*Result, erro
 			j.report(p)
 		}
 
-		piece, err := j.transcribeSpan(ctx, input.Path, span, language, opts, &preferred, report, 0)
+		piece, err := j.transcribeSpan(ctx, input.Path, span, language, opts, &preferred, &verbose, report, 0)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
@@ -230,53 +236,37 @@ func (j *Job) Run(ctx context.Context, input Input, opts Options) (*Result, erro
 	result.SRTPath = srtPath
 	result.TextPath = textPath
 	result.AudioFormat = preferred
+	result.TimestampsEstimated = !verbose
 	result.Segments = len(subtitle.Normalize(cues))
 	return result, nil
 }
 
-// transcribe sends one chunk, falling back to a plain-text response when the
-// provider rejects the verbose (timestamped) request format.
-func (j *Job) transcribe(ctx context.Context, model, language string, audio []byte, format string) (*openrouter.TranscriptionResult, error) {
-	request := openrouter.TranscribeRequest{
+// transcribe sends one chunk with the requested response shape.
+func (j *Job) transcribe(ctx context.Context, model, language string, audio []byte, format string, verbose bool) (*openrouter.TranscriptionResult, error) {
+	return j.Client.Transcribe(ctx, openrouter.TranscribeRequest{
 		Model:    model,
 		Audio:    audio,
 		Format:   format,
 		Language: language,
-		Verbose:  true,
-	}
-	result, err := j.Client.Transcribe(ctx, request)
-	if err == nil {
-		return result, nil
-	}
-	// A refused audio container is the caller's business: it switches encoding.
-	// Retrying the same bytes as plain JSON would only pay for a second upload.
-	if rejectsAudio(err) || !rejectsVerboseFormat(err) {
-		return nil, err
-	}
-
-	request.Verbose = false
-	return j.Client.Transcribe(ctx, request)
+		Verbose:  verbose,
+	})
 }
 
-// rejectsVerboseFormat reports whether the failure looks like a model that
-// ignores response_format, in which case timestamps have to be estimated. The
-// needles stay specific to the request fields: a bare "unsupported" also shows
-// up in audio complaints, and treating those as a format problem costs an
-// upload.
-func rejectsVerboseFormat(err error) bool {
+// requestRefused reports whether the provider refused the request itself, the
+// class of failure a different request shape can fix. The message does not say
+// which field it disliked: asking for timestamped output a route cannot produce
+// is answered with the same generic 400 — "could not process the audio input" —
+// that an unusable container gets, so the two are told apart by trying the
+// cheaper hypothesis, not by reading the text.
+func requestRefused(err error) bool {
 	var apiErr *openrouter.APIError
 	if !errors.As(err, &apiErr) {
 		return false
 	}
-	if apiErr.StatusCode != 400 && apiErr.StatusCode != 404 &&
-		apiErr.StatusCode != 422 && apiErr.StatusCode != 500 {
-		return false
-	}
-	text := strings.ToLower(apiErr.Error())
-	for _, needle := range []string{"response_format", "verbos", "timestamp", "granularit", "invalid_request"} {
-		if strings.Contains(text, needle) {
-			return true
-		}
+	switch apiErr.StatusCode {
+	case http.StatusBadRequest, http.StatusNotFound,
+		http.StatusUnprocessableEntity, http.StatusInternalServerError:
+		return true
 	}
 	return false
 }
@@ -302,7 +292,7 @@ func (p *chunkPiece) merge(other *chunkPiece) {
 // transcribeSpan extracts one span and sends it. Two failures have a defined
 // remedy: a provider that calls the audio malformed is answered with the next
 // encoding, and a payload that is too large for one request is halved.
-func (j *Job) transcribeSpan(ctx context.Context, path string, span chunk.Span, language string, opts Options, preferred *string, report func(Progress), depth int) (*chunkPiece, error) {
+func (j *Job) transcribeSpan(ctx context.Context, path string, span chunk.Span, language string, opts Options, preferred *string, verbose *bool, report func(Progress), depth int) (*chunkPiece, error) {
 	speed := opts.speedValue()
 	formats := orderedFormats(*preferred)
 
@@ -325,7 +315,7 @@ func (j *Job) transcribeSpan(ctx context.Context, path string, span chunk.Span, 
 			mid := span.Start + span.Duration()/2
 			piece := &chunkPiece{}
 			for _, half := range []chunk.Span{{Start: span.Start, End: mid}, {Start: mid, End: span.End}} {
-				part, err := j.transcribeSpan(ctx, path, half, language, opts, preferred, report, depth+1)
+				part, err := j.transcribeSpan(ctx, path, half, language, opts, preferred, verbose, report, depth+1)
 				if err != nil {
 					return nil, err
 				}
@@ -338,7 +328,18 @@ func (j *Job) transcribeSpan(ctx context.Context, path string, span chunk.Span, 
 			Stage:   "uploading",
 			Message: fmt.Sprintf("Transcribing %s as %s…", span, format.Name),
 		})
-		result, err := j.transcribe(ctx, opts.Model, language, audio, format.Name)
+		result, err := j.transcribe(ctx, opts.Model, language, audio, format.Name, *verbose)
+		if err != nil && *verbose && ctx.Err() == nil && requestRefused(err) {
+			// Before paying for a re-encode, check the cheaper explanation: the
+			// route may refuse timestamped output rather than this encoding.
+			report(Progress{
+				Stage:   "uploading",
+				Message: fmt.Sprintf("%s as %s was refused · retrying the same audio without timestamps", span, format.Name),
+			})
+			result, err = j.transcribe(ctx, opts.Model, language, audio, format.Name, false)
+			// A plain refusal settles the question for the rest of the job.
+			*verbose = false
+		}
 		if err == nil {
 			*preferred = format.Name
 			return &chunkPiece{

@@ -187,7 +187,10 @@ func TestJobKeepsGoingAfterOneFailedSpan(t *testing.T) {
 
 	var requests int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if atomic.AddInt32(&requests, 1) == 2 {
+		// One span is unusable. Its first attempt is request 2 and the plain
+		// retry is request 3; both must fail, which is what makes the span
+		// count as failed rather than silently degraded.
+		if n := atomic.AddInt32(&requests, 1); n == 2 || n == 3 {
 			w.WriteHeader(http.StatusBadRequest)
 			io.WriteString(w, `{"error":{"message":"bad audio for this chunk"}}`)
 			return
@@ -249,6 +252,7 @@ func TestJobRetriesRejectedEncoding(t *testing.T) {
 		requests int32
 		mu       sync.Mutex
 		formats  []string
+		shapes   []string
 		payloads []int
 	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -259,6 +263,7 @@ func TestJobRetriesRejectedEncoding(t *testing.T) {
 				Data   string `json:"data"`
 				Format string `json:"format"`
 			} `json:"input_audio"`
+			ResponseFormat string `json:"response_format"`
 		}
 		if err := json.Unmarshal(raw, &body); err != nil {
 			t.Errorf("request is not JSON: %v", err)
@@ -266,6 +271,7 @@ func TestJobRetriesRejectedEncoding(t *testing.T) {
 		}
 		mu.Lock()
 		formats = append(formats, body.InputAudio.Format)
+		shapes = append(shapes, body.ResponseFormat)
 		payloads = append(payloads, len(body.InputAudio.Data))
 		mu.Unlock()
 
@@ -299,14 +305,26 @@ func TestJobRetriesRejectedEncoding(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(formats) != 2 {
-		t.Fatalf("formats tried = %v, want wav then mp3", formats)
+	// The refused container is retried once in the plain shape before the
+	// ladder moves on, so the second wav upload is expected: it is the same
+	// bytes with the same rejection.
+	wantFormats := []string{"wav", "wav", "mp3"}
+	if strings.Join(formats, ",") != strings.Join(wantFormats, ",") {
+		t.Fatalf("formats tried = %v, want %v", formats, wantFormats)
 	}
-	if formats[0] != "wav" || formats[1] != "mp3" {
-		t.Errorf("formats tried = %v, want wav then mp3", formats)
+	// The first request asks for timestamps; the plain retry omits
+	// response_format, which means the default json shape.
+	if shapes[0] != "verbose_json" {
+		t.Errorf("first request shape = %q, want verbose_json", shapes[0])
+	}
+	if shapes[len(shapes)-1] != "" {
+		t.Errorf("last request shape = %q, want the plain default", shapes[len(shapes)-1])
 	}
 	if result.AudioFormat != "mp3" {
 		t.Errorf("result.AudioFormat = %q, want the accepted container", result.AudioFormat)
+	}
+	if !result.TimestampsEstimated {
+		t.Error("TimestampsEstimated should be set after the timestamped shape was refused")
 	}
 	if len(result.Failed) != 0 {
 		t.Errorf("the chunk failed despite a working fallback: %v", result.Failed)
@@ -320,5 +338,98 @@ func TestJobRetriesRejectedEncoding(t *testing.T) {
 	}
 	if !strings.Contains(string(srt), "00:00:02,000 --> 00:00:04,000") {
 		t.Errorf("timestamps were not stretched back to the original timeline:\n%s", srt)
+	}
+}
+
+// TestJobDropsTimestampsBeforeChangingEncoding covers the other reading of the
+// same generic 400. A route that cannot produce timestamped output answers
+// every container with "could not process the audio input"; re-encoding to mp3,
+// flac and pcm16 would then burn four uploads to learn what one plain retry
+// shows for free.
+func TestJobDropsTimestampsBeforeChangingEncoding(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping ffmpeg integration test in short mode")
+	}
+	ctx := context.Background()
+
+	install, ok := ffmpeg.Resolve(ctx, "")
+	if !ok {
+		t.Skip("ffmpeg is not installed; skipping the end-to-end test")
+	}
+
+	dir := t.TempDir()
+	sample := filepath.Join(dir, "talk.wav")
+	cmd := exec.CommandContext(ctx, install.FFmpeg,
+		"-hide_banner", "-loglevel", "error", "-nostdin",
+		"-f", "lavfi", "-i", "sine=frequency=300:duration=8",
+		"-y", sample)
+	executil.Hide(cmd)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("could not build the sample file: %v\n%s", err, out)
+	}
+
+	var (
+		mu      sync.Mutex
+		formats []string
+		shapes  []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var body struct {
+			InputAudio struct {
+				Format string `json:"format"`
+			} `json:"input_audio"`
+			ResponseFormat      string   `json:"response_format"`
+			TimestampGranularit []string `json:"timestamp_granularities"`
+		}
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Errorf("request is not JSON: %v", err)
+			return
+		}
+		mu.Lock()
+		formats = append(formats, body.InputAudio.Format)
+		shapes = append(shapes, body.ResponseFormat)
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		// Exactly the message NVIDIA's route produced for every container.
+		if len(body.TimestampGranularit) > 0 || body.ResponseFormat == "verbose_json" {
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, `{"error":{"message":"Provider could not process the audio input (unsupported or malformed audio)","code":400}}`)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"text":  "no timestamps here",
+			"usage": map[string]any{"cost": 0.00001},
+		})
+	}))
+	defer srv.Close()
+
+	client := openrouter.New("test-key")
+	client.BaseURL = srv.URL
+
+	job := &Job{FFmpeg: install, Client: client}
+	result, err := job.Run(ctx, Input{Path: sample}, Options{Model: "nvidia/nemotron-test"})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	wantFormats := []string{"wav", "wav"}
+	if strings.Join(formats, ",") != strings.Join(wantFormats, ",") {
+		t.Fatalf("formats tried = %v, want %v (no re-encoding before the plain retry)", formats, wantFormats)
+	}
+	if result.AudioFormat != "wav" {
+		t.Errorf("result.AudioFormat = %q, want wav", result.AudioFormat)
+	}
+	if !result.TimestampsEstimated {
+		t.Error("TimestampsEstimated should be set when the model gave no segment times")
+	}
+	if result.Segments == 0 {
+		t.Error("cues should still be written from the plain transcript")
+	}
+	if len(result.Failed) != 0 {
+		t.Errorf("the chunk failed despite a working plain request: %v", result.Failed)
 	}
 }

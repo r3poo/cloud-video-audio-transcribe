@@ -150,7 +150,7 @@ ffmpeg is installed; to include them, either install ffmpeg or point
 | `ffmpeg could not be obtained` | Both mirrors are unreachable. Install ffmpeg manually (`winget install Gyan.FFmpeg`, `scoop install ffmpeg`, or a zip in `C:\ffmpeg\bin`) and restart. |
 | `no audio stream` | The file is video-only or the container is broken; check that it plays elsewhere. |
 | Empty transcript | The chosen model does not really support audio, even if it advertises it. Pick a Whisper model. |
-| `Provider could not process the audio input` or `unsupported or malformed audio` | The model's backend refused the container. The program retries that chunk as WAV, MP3, FLAC and raw PCM before giving up; when all four are refused, the model does not really support audio — switch to another one. |
+| `Provider could not process the audio input` or `unsupported or malformed audio` | Two different problems share this one message: a container the route cannot decode, and a *request option* it cannot honour (typically timestamped output). The program tries the plain request shape on the same bytes first — no re-encode — and only then walks the container list. If all four containers fail in both shapes, the model does not really support audio — switch to another one. |
 | `400`/`422` from the API | A chunk was rejected, usually a rate limit or size limit. The span is logged and skipped; lower `TRANSCRIBE_CHUNK_SECONDS` if it repeats. |
 
 ## How it works
@@ -182,6 +182,13 @@ Design notes:
   cannot take the audio, which is a model problem rather than a file problem.
   The container that worked is saved as `TRANSCRIBE_AUDIO_FORMAT` and tried
   first next time.
+- Before any re-encode happens, a refused chunk is re-sent unchanged in the
+  plain (non-timestamped) response shape. OpenRouter's gateway reuses the one
+  message above for "an audio option the routed provider does not support", so
+  asking for `verbose_json` on a route that cannot produce timestamps looks
+  exactly like corrupt audio — and costs four uploads to diagnose otherwise.
+  When the plain shape works, the job continues with it and the log says the
+  cue times were estimated from text length.
 - The playback factor is an `atempo` chain (2× → `atempo=2`, 3× →
   `atempo=2,atempo=1.5`), applied while cutting the chunk, so no extra pass over
   the file is needed.

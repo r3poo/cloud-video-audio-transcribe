@@ -742,6 +742,9 @@ func (a *app) markDone(index int, result *transcribe.Result) {
 	a.appendLog("Wrote " + result.TextPath)
 	a.appendLog(fmt.Sprintf("Transcribed %s in %d part(s), %d cues as %s audio%s",
 		humanDuration(result.Duration), result.Spans, result.Segments, result.AudioFormat, costSuffix(result.CostUSD)))
+	if result.TimestampsEstimated {
+		a.appendLog("This model would not return word timing, so cue times were spaced by text length; they drift from the speakers.")
+	}
 	a.remember(keyFormat, result.AudioFormat)
 	if len(result.Failed) > 0 {
 		a.appendLog(fmt.Sprintf("Warning: %d part(s) of %s failed and are missing from the output.",

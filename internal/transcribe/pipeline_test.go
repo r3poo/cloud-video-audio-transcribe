@@ -14,7 +14,11 @@ import (
 	"cloudtranscribe/internal/subtitle"
 )
 
-func TestRejectsVerboseFormat(t *testing.T) {
+// The generic 400 a provider returns for an unsupported request shape carries no
+// hint about the field it disliked: OpenRouter's gateway reuses
+// "could not process the audio input" for both a bad container and a bad option.
+// So the retry rule is driven by the status alone.
+func TestRequestRefused(t *testing.T) {
 	tests := []struct {
 		name string
 		err  error
@@ -23,26 +27,27 @@ func TestRejectsVerboseFormat(t *testing.T) {
 		{"nil", nil, false},
 		{"rate limited", &openrouter.APIError{StatusCode: 429, Message: "slow down"}, false},
 		{"auth", &openrouter.APIError{StatusCode: 401, Message: "invalid key"}, false},
-		{"400 mentions format", &openrouter.APIError{StatusCode: 400, Message: "unsupported response_format"}, true},
-		{"400 mentions timestamps", &openrouter.APIError{StatusCode: 422, Message: "timestamp_granularities not supported"}, true},
-		{"400 generic message", &openrouter.APIError{StatusCode: 400, Message: "bad request"}, false},
+		{"payment", &openrouter.APIError{StatusCode: 402, Message: "insufficient credits"}, false},
+		{"forbidden", &openrouter.APIError{StatusCode: 403, Message: "spend limit"}, false},
+		{"upstream failed", &openrouter.APIError{StatusCode: 502, Message: "upstream audio failed"}, false},
+		{"400 names the format", &openrouter.APIError{StatusCode: 400, Message: "unsupported response_format"}, true},
+		{"422 names timestamps", &openrouter.APIError{StatusCode: 422, Message: "timestamp_granularities not supported"}, true},
+		{"400 generic", &openrouter.APIError{StatusCode: 400, Message: "bad request"}, true},
+		{"400 blames the audio", &openrouter.APIError{StatusCode: 400, Message: "Provider could not process the audio input (unsupported or malformed audio)"}, true},
 		{"joined", errors.Join(errors.New("ctx"), &openrouter.APIError{StatusCode: 400, Message: "verbosity unsupported"}), true},
-		// An audio-container complaint must not be mistaken for a
-		// response_format problem: that would upload the chunk twice.
-		{"audio rejected", &openrouter.APIError{StatusCode: 400, Message: "Provider could not process the audio input (unsupported or malformed audio)"}, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := rejectsVerboseFormat(tc.err); got != tc.want {
-				t.Errorf("rejectsVerboseFormat(%v) = %v, want %v", tc.err, got, tc.want)
+			if got := requestRefused(tc.err); got != tc.want {
+				t.Errorf("requestRefused(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
 	}
 }
 
-func TestRejectsVerboseFormatThroughWrap(t *testing.T) {
+func TestRequestRefusedThroughWrap(t *testing.T) {
 	wrapped := error(&wrappedErr{inner: &openrouter.APIError{StatusCode: 400, Message: "response_format invalid"}})
-	if !rejectsVerboseFormat(wrapped) {
+	if !requestRefused(wrapped) {
 		t.Error("errors.As should see the APIError through the wrapper")
 	}
 }
