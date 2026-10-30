@@ -1,6 +1,7 @@
 package transcribe
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -25,6 +26,9 @@ func TestRejectsVerboseFormat(t *testing.T) {
 		{"400 mentions timestamps", &openrouter.APIError{StatusCode: 422, Message: "timestamp_granularities not supported"}, true},
 		{"400 generic message", &openrouter.APIError{StatusCode: 400, Message: "bad request"}, false},
 		{"joined", errors.Join(errors.New("ctx"), &openrouter.APIError{StatusCode: 400, Message: "verbosity unsupported"}), true},
+		// An audio-container complaint must not be mistaken for a
+		// response_format problem: that would upload the chunk twice.
+		{"audio rejected", &openrouter.APIError{StatusCode: 400, Message: "Provider could not process the audio input (unsupported or malformed audio)"}, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -54,7 +58,7 @@ func TestSegmentsToCuesAppliesOffset(t *testing.T) {
 			{Start: 2, End: 3, Text: "there"},
 		},
 	}
-	cues := segmentsToCues(result, chunk.Span{Start: 600, End: 1200})
+	cues := segmentsToCues(result, chunk.Span{Start: 600, End: 1200}, 1)
 	if len(cues) != 2 {
 		t.Fatalf("got %d cues, want 2", len(cues))
 	}
@@ -62,7 +66,7 @@ func TestSegmentsToCuesAppliesOffset(t *testing.T) {
 		t.Errorf("cues not shifted onto the recording timeline: %v", cues)
 	}
 
-	if got := segmentsToCues(&openrouter.TranscriptionResult{}, chunk.Span{}); got != nil {
+	if got := segmentsToCues(&openrouter.TranscriptionResult{}, chunk.Span{}, 1); got != nil {
 		t.Errorf("segmentsToCues with no segments = %v, want nil", got)
 	}
 }
@@ -183,4 +187,75 @@ func TestRunValidatesInput(t *testing.T) {
 	if _, err := job.Run(t.Context(), Input{Path: "x"}, Options{Model: ""}); err == nil {
 		t.Error("Run accepted a job without a model")
 	}
+}
+
+func TestSegmentsToCuesStretchesSpeedyAudio(t *testing.T) {
+	// At 2× the model sees a clip half as long, so its timestamps must double
+	// to land back on the original recording.
+	result := &openrouter.TranscriptionResult{
+		Segments: []openrouter.Segment{{Start: 1, End: 2, Text: "fast"}},
+	}
+	cues := segmentsToCues(result, chunk.Span{Start: 100, End: 400}, 2)
+	if len(cues) != 1 {
+		t.Fatalf("got %d cues, want 1", len(cues))
+	}
+	if cues[0].Start != 102 || cues[0].End != 104 {
+		t.Errorf("cue = %.2f..%.2f, want 102..104", cues[0].Start, cues[0].End)
+	}
+}
+
+func TestRejectsAudioOnlyFiresForAudioComplaints(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{"nemotron message", 400, `{"error":{"message":"Provider could not process the audio input (unsupported or malformed audio)","code":400}}`, true},
+		{"unsupported media type", 415, `{"error":{"message":"audio format is not supported"}}`, true},
+		{"empty audio", 400, `{"error":{"message":"audio is empty"}}`, true},
+		{"bad model", 400, `{"error":{"message":"invalid model id"}}`, false},
+		{"bad response format", 400, `{"error":{"message":"response_format is unsupported for this model"}}`, false},
+		{"server error", 500, `{"error":{"message":"audio backend exploded"}}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := &openrouter.APIError{StatusCode: tc.status, Message: messageOf(tc.body)}
+			if got := rejectsAudio(err); got != tc.want {
+				t.Errorf("rejectsAudio(%d %s) = %v, want %v", tc.status, tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRejectsAudioIgnoresPlainErrors(t *testing.T) {
+	if rejectsAudio(errors.New("audio was malformed")) {
+		t.Error("a non-API error must not trigger a re-encode")
+	}
+}
+
+func TestSpeedValueClampsToTheOfferedRange(t *testing.T) {
+	cases := map[float64]float64{
+		0: 1, 1: 1, 1.5: 1.5, 4: 4,
+		-2: 1, 0.25: 1, 9: 1,
+	}
+	for in, want := range cases {
+		if got := (Options{Speed: in}).speedValue(); got != want {
+			t.Errorf("speedValue(%v) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+// messageOf pulls the error message out of a fake API body, so the test cases
+// read like the JSON the provider actually sends.
+func messageOf(body string) string {
+	var payload struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		panic(err)
+	}
+	return payload.Error.Message
 }

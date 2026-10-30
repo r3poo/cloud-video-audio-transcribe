@@ -31,6 +31,7 @@ const (
 	keyModel     = "OPENROUTER_MODEL"
 	keyChunkSize = "TRANSCRIBE_CHUNK_SECONDS"
 	keyOutputDir = "TRANSCRIBE_OUTPUT_DIR"
+	keySpeed     = "TRANSCRIBE_SPEED"
 )
 
 type app struct {
@@ -54,11 +55,14 @@ type app struct {
 	ffmpegNote string
 	modelsNote string
 
-	lblFFmpeg   *walk.Label
-	cmbModel    *walk.ComboBox
-	lblModel    *walk.Label
+	lblFFmpeg *walk.Label
+	cmbModel  *walk.ComboBox
+	lblModel  *walk.Label
+	// cmbSpeed picks the playback factor that decides how many billed seconds
+	// a recording costs.
+	cmbSpeed    *walk.ComboBox
+	lblSpeed    *walk.Label
 	btnReload   *walk.PushButton
-	btnPick     *walk.PushButton
 	lstQueue    *walk.ListBox
 	lblQueue    *walk.Label
 	btnAdd      *walk.PushButton
@@ -135,11 +139,6 @@ func (a *app) build() error {
 								OnCurrentIndexChanged: a.describeModel,
 							},
 							declarative.PushButton{
-								AssignTo:  &a.btnPick,
-								Text:      "Change…",
-								OnClicked: a.pickModelDialog,
-							},
-							declarative.PushButton{
 								AssignTo:  &a.btnReload,
 								Text:      "Reload list",
 								OnClicked: a.reloadModels,
@@ -148,6 +147,31 @@ func (a *app) build() error {
 					},
 					declarative.Label{
 						AssignTo: &a.lblModel,
+						Text:     " ",
+					},
+				},
+			},
+			declarative.GroupBox{
+				Title:  "Cost: send the audio faster",
+				Layout: declarative.VBox{Spacing: 4},
+				Children: []declarative.Widget{
+					declarative.Composite{
+						Layout: declarative.HBox{Spacing: 8},
+						Children: []declarative.Widget{
+							declarative.Label{
+								Text: "Playback speed",
+							},
+							declarative.ComboBox{
+								AssignTo:              &a.cmbSpeed,
+								Model:                 speedLabels(),
+								CurrentIndex:          0,
+								OnCurrentIndexChanged: a.describeSpeed,
+							},
+							declarative.HSpacer{},
+						},
+					},
+					declarative.Label{
+						AssignTo: &a.lblSpeed,
 						Text:     " ",
 					},
 				},
@@ -290,7 +314,9 @@ func (a *app) loadEnvironment() {
 // interactive immediately.
 func (a *app) startup() {
 	a.refreshQueue()
+	a.applySavedSpeed()
 	a.refreshReadiness()
+	a.describeSpeed()
 	a.logf("%s ready. ffmpeg, API key and models are being checked.", appName)
 	if a.envPath != "" {
 		a.logf("Settings file: %s", a.envPath)
@@ -439,12 +465,10 @@ func (a *app) prepareModels() {
 		a.appendLog(fmt.Sprintf("Loaded %d transcription models.", len(models)))
 		a.refreshReadiness()
 
-		// First run: the requirement is to let the user pick, so show the list.
-		// It is queued rather than called here: a modal dialog opened inside a
-		// Synchronize callback would hold up every other queued update, such as
-		// the ffmpeg check finishing and enabling the Transcribe button.
+		// The dropdown holds the whole list, so a first run needs no dialog;
+		// just point at it when the choice is still the default.
 		if !remembered {
-			a.ui(a.pickModelDialog)
+			a.appendLog("Pick the model in the dropdown. 2× playback speed halves the bill.")
 		}
 	})
 }
@@ -596,8 +620,9 @@ func (a *app) startRun() {
 
 	opts := a.options()
 
-	// Remember the model and the output folder for the next run.
+	// Remember the model, the factor and the output folder for the next run.
 	a.remember(keyModel, opts.Model)
+	a.remember(keySpeed, strconv.FormatFloat(opts.Speed, 'g', -1, 64))
 	if opts.OutputDir != "" {
 		a.remember(keyOutputDir, opts.OutputDir)
 	}
@@ -631,6 +656,7 @@ func (a *app) options() transcribe.Options {
 			opts.ChunkSeconds = seconds
 		}
 	}
+	opts.Speed = a.speedFactor()
 	if opts.OutputDir == "" {
 		opts.OutputDir = a.env.Get(keyOutputDir)
 	}
@@ -809,10 +835,10 @@ func (a *app) setBusy(busy bool) {
 	a.busy = busy
 	a.btnAdd.SetEnabled(!busy)
 	a.btnOut.SetEnabled(!busy)
-	a.btnReload.SetEnabled(!busy)
-	a.btnPick.SetEnabled(!busy && len(a.models) > 0)
+	a.btnReload.SetEnabled(!busy && a.client != nil)
 	a.btnCancel.SetEnabled(busy)
 	a.cmbModel.SetEnabled(!busy)
+	a.cmbSpeed.SetEnabled(!busy)
 	a.lineOut.SetEnabled(!busy)
 	a.lstQueue.SetEnabled(!busy)
 	if busy {
@@ -998,4 +1024,68 @@ func canWrite(dir string) bool {
 	probe.Close()
 	_ = os.Remove(name)
 	return true
+}
+
+// --- speed ---------------------------------------------------------------
+
+// speedChoices are the playback factors offered in the window. Speeding the
+// audio up shortens what the provider bills for; the high values are there for
+// long lectures where a rough transcript beats paying twice.
+var speedChoices = []struct {
+	label  string
+	factor float64
+}{
+	{"1× (original speed)", 1},
+	{"1.25×", 1.25},
+	{"1.5×", 1.5},
+	{"2× (half the cost)", 2},
+	{"2.5×", 2.5},
+	{"3×", 3},
+}
+
+func speedLabels() []string {
+	labels := make([]string, len(speedChoices))
+	for i, c := range speedChoices {
+		labels[i] = c.label
+	}
+	return labels
+}
+
+// speedFactor is the chosen factor. Out-of-range indexes mean normal speed.
+func (a *app) speedFactor() float64 {
+	index := a.cmbSpeed.CurrentIndex()
+	if index < 0 || index >= len(speedChoices) {
+		return 1
+	}
+	return speedChoices[index].factor
+}
+
+// applySavedSpeed selects the factor last used, so the choice survives a
+// restart the way the model and the output folder do.
+func (a *app) applySavedSpeed() {
+	raw := a.env.Get(keySpeed)
+	factor, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return
+	}
+	for i, choice := range speedChoices {
+		if choice.factor == factor {
+			_ = a.cmbSpeed.SetCurrentIndex(i)
+			return
+		}
+	}
+}
+
+// describeSpeed spells out what the factor costs in money and accuracy, so the
+// trade-off is visible before a run rather than in the bill.
+func (a *app) describeSpeed() {
+	factor := a.speedFactor()
+	if factor <= 1 {
+		a.lblSpeed.SetText("Original speed: one billed second per recorded second.")
+		return
+	}
+	percent := int(100/factor + 0.5)
+	a.lblSpeed.SetText(fmt.Sprintf(
+		"Sent at %s×: about %d%% of the usual cost. Very fast speech, overlapping speakers or music may lose words.",
+		strconv.FormatFloat(factor, 'g', -1, 64), percent))
 }

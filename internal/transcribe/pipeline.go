@@ -7,8 +7,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,6 +38,25 @@ type Options struct {
 	// OutputDir overrides where results are written. Empty means next to the
 	// input file.
 	OutputDir string
+	// Speed plays the audio faster before sending it. Providers bill by audio
+	// second, so 2 halves the cost of every chunk. Zero or out-of-range values
+	// mean normal speed.
+	Speed float64
+}
+
+// Speed limits. Below 0.5 speech drags, above 4 the models start dropping
+// words, and both cost accuracy rather than just money.
+const (
+	MinSpeed = 0.5
+	MaxSpeed = 4.0
+)
+
+// speedValue is the factor actually used for extraction.
+func (o Options) speedValue() float64 {
+	if !(o.Speed >= MinSpeed && o.Speed <= MaxSpeed) {
+		return 1
+	}
+	return o.Speed
 }
 
 func (o Options) chunkTarget() float64 {
@@ -134,42 +155,35 @@ func (j *Job) Run(ctx context.Context, input Input, opts Options) (*Result, erro
 		language = opts.Language
 	}
 
+	speed := opts.speedValue()
+	if speed != 1 {
+		j.report(Progress{
+			Stage:   "probing",
+			Message: fmt.Sprintf("Playing the audio at %s× so the model is billed for less of it…", trimFloat(speed)),
+		})
+	}
+
 	result := &Result{Duration: secondsToDuration(info.Duration), Spans: len(spans)}
 	var (
 		cues     []subtitle.Cue
 		texts    []string
 		firstErr error
 	)
+	// formatIndex remembers the container the provider accepted, so a rejected
+	// encoding costs one retry for the first chunk instead of one per chunk.
+	formatIndex := 0
 
 	for idx, span := range spans {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		j.report(Progress{
-			Stage:    "downloading audio",
-			Message:  fmt.Sprintf("Extracting audio for %s…", span),
-			Done:     idx,
-			Total:    len(spans),
-			Fraction: float64(idx) / float64(len(spans)),
-		})
-
-		audio, format, err := j.FFmpeg.ExtractChunk(ctx, input.Path, span.Start, span.Duration())
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			return nil, fmt.Errorf("audio extraction failed for %s: %w", span, err)
+		report := func(p Progress) {
+			p.Done, p.Total = idx, len(spans)
+			p.Fraction = float64(idx) / float64(len(spans))
+			j.report(p)
 		}
 
-		j.report(Progress{
-			Stage:    "uploading",
-			Message:  fmt.Sprintf("Transcribing %s (%s)…", span, format),
-			Done:     idx,
-			Total:    len(spans),
-			Fraction: float64(idx) / float64(len(spans)),
-		})
-
-		transcript, err := j.transcribe(ctx, opts.Model, language, audio, format)
+		piece, err := j.transcribeSpan(ctx, input.Path, span, language, opts, &formatIndex, report, 0)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
@@ -181,14 +195,9 @@ func (j *Job) Run(ctx context.Context, input Input, opts Options) (*Result, erro
 			continue
 		}
 
-		texts = append(texts, transcript.Text)
-		result.CostUSD += transcript.Usage.Cost
-
-		spanCues := segmentsToCues(transcript, span)
-		if len(spanCues) == 0 && strings.TrimSpace(transcript.Text) != "" {
-			spanCues = subtitle.Estimate(transcript.Text, span.Start, span.End, subtitle.DefaultLineWidth)
-		}
-		cues = append(cues, spanCues...)
+		texts = append(texts, piece.texts...)
+		cues = append(cues, piece.cues...)
+		result.CostUSD += piece.cost
 	}
 
 	if len(result.Failed) == len(spans) {
@@ -230,7 +239,9 @@ func (j *Job) transcribe(ctx context.Context, model, language string, audio []by
 	if err == nil {
 		return result, nil
 	}
-	if !rejectsVerboseFormat(err) {
+	// A refused audio container is the caller's business: it switches encoding.
+	// Retrying the same bytes as plain JSON would only pay for a second upload.
+	if rejectsAudio(err) || !rejectsVerboseFormat(err) {
 		return nil, err
 	}
 
@@ -239,7 +250,10 @@ func (j *Job) transcribe(ctx context.Context, model, language string, audio []by
 }
 
 // rejectsVerboseFormat reports whether the failure looks like a model that
-// ignores response_format. Timestamps then have to be estimated.
+// ignores response_format, in which case timestamps have to be estimated. The
+// needles stay specific to the request fields: a bare "unsupported" also shows
+// up in audio complaints, and treating those as a format problem costs an
+// upload.
 func rejectsVerboseFormat(err error) bool {
 	var apiErr *openrouter.APIError
 	if !errors.As(err, &apiErr) {
@@ -250,7 +264,7 @@ func rejectsVerboseFormat(err error) bool {
 		return false
 	}
 	text := strings.ToLower(apiErr.Error())
-	for _, needle := range []string{"response_format", "verbos", "timestamp", "granularit", "unsupported", "invalid_request"} {
+	for _, needle := range []string{"response_format", "verbos", "timestamp", "granularit", "invalid_request"} {
 		if strings.Contains(text, needle) {
 			return true
 		}
@@ -258,17 +272,159 @@ func rejectsVerboseFormat(err error) bool {
 	return false
 }
 
+// maxPayloadBytes is the largest audio chunk sent in one request. OpenRouter
+// caps an inline payload at 25 MB and base64 adds a third, so this leaves room
+// to spare; a span that would exceed it is split.
+const maxPayloadBytes = 17 << 20
+
+// chunkPiece is what one span, or one half of a split span, contributes.
+type chunkPiece struct {
+	texts []string
+	cues  []subtitle.Cue
+	cost  float64
+}
+
+func (p *chunkPiece) merge(other *chunkPiece) {
+	p.texts = append(p.texts, other.texts...)
+	p.cues = append(p.cues, other.cues...)
+	p.cost += other.cost
+}
+
+// transcribeSpan extracts one span and sends it. Two failures have a defined
+// remedy: a provider that calls the audio malformed is answered with the next
+// encoding, and a payload that is too large for one request is halved.
+func (j *Job) transcribeSpan(ctx context.Context, path string, span chunk.Span, language string, opts Options, formatIndex *int, report func(Progress), depth int) (*chunkPiece, error) {
+	speed := opts.speedValue()
+	formats := ffmpeg.AudioFormats()
+	if *formatIndex < 0 || *formatIndex >= len(formats) {
+		*formatIndex = 0
+	}
+
+	var lastErr error
+	var attempted []string
+	for attempt := *formatIndex; attempt < len(formats); attempt++ {
+		format := formats[attempt]
+		attempted = append(attempted, format.Name)
+
+		report(Progress{
+			Stage:   "downloading audio",
+			Message: fmt.Sprintf("Extracting %s audio for %s…", format.Name, span),
+		})
+		audio, err := j.FFmpeg.ExtractChunk(ctx, path, span.Start, span.Duration(), format, speed)
+		if err != nil {
+			return nil, fmt.Errorf("audio extraction failed for %s: %w", span, err)
+		}
+
+		if len(audio) > maxPayloadBytes && span.Duration() > 2*chunk.MinTarget && depth < 3 {
+			mid := span.Start + span.Duration()/2
+			piece := &chunkPiece{}
+			for _, half := range []chunk.Span{{Start: span.Start, End: mid}, {Start: mid, End: span.End}} {
+				part, err := j.transcribeSpan(ctx, path, half, language, opts, formatIndex, report, depth+1)
+				if err != nil {
+					return nil, err
+				}
+				piece.merge(part)
+			}
+			return piece, nil
+		}
+
+		report(Progress{
+			Stage:   "uploading",
+			Message: fmt.Sprintf("Transcribing %s as %s…", span, format.Name),
+		})
+		result, err := j.transcribe(ctx, opts.Model, language, audio, format.Name)
+		if err == nil {
+			*formatIndex = attempt
+			return &chunkPiece{
+				texts: []string{result.Text},
+				cues:  cuesFor(result, span, speed),
+				cost:  result.Usage.Cost,
+			}, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if !rejectsAudio(err) {
+			return nil, err
+		}
+
+		lastErr = fmt.Errorf("%s audio was rejected by the provider: %w", format.Name, err)
+		if attempt+1 < len(formats) {
+			report(Progress{
+				Stage:   "uploading",
+				Message: fmt.Sprintf("%s · retrying %s as %s", lastErr, span, formats[attempt+1].Name),
+			})
+		}
+	}
+	if lastErr == nil {
+		return nil, fmt.Errorf("no audio could be extracted from %s", span)
+	}
+	// Every container was refused, so this model cannot take the audio at all
+	// and the honest advice is to switch models rather than to retry.
+	return nil, fmt.Errorf("the provider rejected %s audio for %s; try a different transcription model — %w",
+		strings.Join(attempted, ", "), span, lastErr)
+}
+
+// rejectsAudio reports whether the provider refused the audio itself, which is
+// the one failure a different container can fix. Providers phrase it as
+// "unsupported or malformed audio" or "could not process the audio input" and
+// answer with 400 (or 415); the message always mentions audio.
+func rejectsAudio(err error) bool {
+	var apiErr *openrouter.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	if apiErr.StatusCode != http.StatusBadRequest && apiErr.StatusCode != http.StatusUnsupportedMediaType {
+		return false
+	}
+	text := strings.ToLower(apiErr.Error())
+	if !strings.Contains(text, "audio") {
+		return false
+	}
+	for _, needle := range []string{
+		"malformed", "unsupported", "not supported", "could not process", "cannot process",
+		"invalid", "decode", "corrupt", "truncated", "empty",
+	} {
+		if strings.Contains(text, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// cuesFor turns a transcript into subtitle cues on the original timeline.
+func cuesFor(result *openrouter.TranscriptionResult, span chunk.Span, speed float64) []subtitle.Cue {
+	cues := segmentsToCues(result, span, speed)
+	if len(cues) == 0 && strings.TrimSpace(result.Text) != "" {
+		cues = subtitle.Estimate(result.Text, span.Start, span.End, subtitle.DefaultLineWidth)
+	}
+	return cues
+}
+
 // segmentsToCues shifts provider timestamps into the timeline of the whole
-// recording.
-func segmentsToCues(result *openrouter.TranscriptionResult, span chunk.Span) []subtitle.Cue {
+// recording. When the audio was sped up, the model's timestamps describe the
+// shortened clip, so they are stretched back by the same factor.
+func segmentsToCues(result *openrouter.TranscriptionResult, span chunk.Span, speed float64) []subtitle.Cue {
 	if len(result.Segments) == 0 {
 		return nil
 	}
+	if !(speed > 0) {
+		speed = 1
+	}
 	segments := make([]subtitle.Segment, 0, len(result.Segments))
 	for _, s := range result.Segments {
-		segments = append(segments, subtitle.Segment{Start: s.Start, End: s.End, Text: s.Text})
+		segments = append(segments, subtitle.Segment{
+			Start: s.Start * speed,
+			End:   s.End * speed,
+			Text:  s.Text,
+		})
 	}
 	return subtitle.FromSegments(segments, span.Start)
+}
+
+// trimFloat renders a factor without trailing zeros: 1.5, 2, 1.25.
+func trimFloat(v float64) string {
+	return strconv.FormatFloat(v, 'g', -1, 64)
 }
 
 // writeOutputs stores the .srt and .txt next to the source, never overwriting

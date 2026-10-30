@@ -94,7 +94,74 @@ func candidates(exeDir string) []candidate {
 	for _, dir := range installDirs() {
 		out = append(out, candidate{filepath.Join(dir, binaryName("ffmpeg")), "system install"})
 	}
+	// Package managers install into versioned folders, so these are matched
+	// with a wildcard: winget's Gyan.FFmpeg package, scoop, and chocolatey.
+	for _, dir := range expandGlobs(globInstallDirs()) {
+		out = append(out, candidate{filepath.Join(dir, binaryName("ffmpeg")), "package manager"})
+	}
+	// Finally the folders video players are installed in, which is where people
+	// put ffmpeg.exe when they follow a guide that names a VLC directory.
+	for _, dir := range mediaPlayerDirs() {
+		out = append(out, candidate{filepath.Join(dir, binaryName("ffmpeg")), "player install (VLC)"})
+	}
 	return out
+}
+
+// expandGlobs resolves wildcard patterns, skipping the ones that match nothing.
+func expandGlobs(patterns []string) []string {
+	var out []string
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+		out = append(out, matches...)
+	}
+	return out
+}
+
+// globInstallDirs lists the versioned install locations package managers use.
+func globInstallDirs() []string {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+	var patterns []string
+	if local := os.Getenv("LOCALAPPDATA"); local != "" {
+		patterns = append(patterns,
+			filepath.Join(local, "Microsoft", "WinGet", "Packages", "Gyan.FFmpeg*", "ffmpeg*", "bin"),
+			filepath.Join(local, "Microsoft", "WinGet", "Packages", "BtbN.FFmpeg*", "ffmpeg*", "bin"),
+		)
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		patterns = append(patterns, filepath.Join(home, "scoop", "apps", "ffmpeg*", "current", "bin"))
+	}
+	for _, root := range []string{os.Getenv("ProgramData"), `C:\ProgramData`} {
+		if root == "" {
+			continue
+		}
+		patterns = append(patterns, filepath.Join(root, "chocolatey", "lib", "ffmpeg*", "tools", "ffmpeg*", "bin"))
+	}
+	return patterns
+}
+
+// mediaPlayerDirs mirrors the folders VLC looks in for its own modules: its
+// install directory as recorded in the registry, the usual Program Files
+// location, and the per-user folder. Scripts and guides habitually drop
+// ffmpeg.exe next to VLC, so searching there finds those copies too.
+func mediaPlayerDirs() []string {
+	dirs := registryInstallDirs()
+	if runtime.GOOS != "windows" {
+		return dirs
+	}
+	for _, root := range []string{os.Getenv("ProgramFiles"), os.Getenv("ProgramFiles(x86)")} {
+		if root != "" {
+			dirs = append(dirs, filepath.Join(root, "VideoLAN", "VLC"))
+		}
+	}
+	if appData := os.Getenv("APPDATA"); appData != "" {
+		dirs = append(dirs, filepath.Join(appData, "vlc"), filepath.Join(appData, "vlc", "plugins"))
+	}
+	return dirs
 }
 
 // installDirs lists the directories package managers and manual installs use
@@ -115,6 +182,12 @@ func installDirs() []string {
 				filepath.Join(local, "Programs", "ffmpeg", "bin"),
 			)
 		}
+		if root := os.Getenv("ProgramFiles"); root != "" {
+			dirs = append(dirs, filepath.Join(root, "ffmpeg"))
+		}
+		// Some zip builds unpack flat, with ffmpeg.exe in the archive root
+		// rather than in bin.
+		dirs = append(dirs, `C:\ffmpeg`)
 		if home, err := os.UserHomeDir(); err == nil {
 			dirs = append(dirs, filepath.Join(home, "scoop", "shims"))
 		}
@@ -162,6 +235,13 @@ func findFFprobe(ffmpegPath string) string {
 	}
 	if p, err := exec.LookPath(binaryName("ffprobe")); err == nil {
 		return p
+	}
+	// ffprobe also turns up alone, for example in a player's install folder.
+	for _, dir := range mediaPlayerDirs() {
+		candidate := filepath.Join(dir, binaryName("ffprobe"))
+		if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+			return candidate
+		}
 	}
 	return ""
 }

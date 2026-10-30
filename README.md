@@ -38,17 +38,23 @@ piece to [OpenRouter](https://openrouter.ai) for transcription, then writes a
    rather than silently dropped. Supported containers: mp3, wav, m4a, aac, flac,
    ogg/opus, wma, mp4, mkv, mov, avi, webm, wmv, mpg, ts, 3gp and a few more.
    Anything ffmpeg can decode works.
-2. **Pick a model** — *Change…* opens the list fetched from
-   `/api/v1/models`, filtered to models that declare audio input. The list shows
-   the price per audio token/hour where the model publishes it. Whisper-family
-   models (`openai/whisper-large-v3`, `openai/whisper-1`, …) are the usual
-   choice; free variants exist but are rate limited.
-3. **Press Transcribe.** The queue is processed one file at a time. The progress
+2. **Pick a model** — the dropdown holds every model fetched from
+   `/api/v1/models` that declares audio input, with the price per audio
+   token/hour where the model publishes it. Whisper-family models
+   (`openai/whisper-large-v3`, `openai/whisper-1`, …) are the usual choice; free
+   variants exist but are rate limited. The choice is written to `.env` so it
+   survives a restart.
+3. **Optionally speed the audio up.** *Cost: send the audio faster* offers
+   1.25×, 1.5×, 2× (half the price), 2.5× and 3×. The factor is applied by
+   ffmpeg before upload with `atempo`, which compresses time without changing
+   pitch, and subtitle timestamps are stretched back to the original timeline,
+   so results still line up with the recording.
+4. **Press Transcribe.** The queue is processed one file at a time. The progress
    bar covers the whole batch, and the line above it names the file being worked
    on. A file that fails is marked in the list and the batch continues; *Cancel*
    stops the batch instead of moving to the next file. Pressing Transcribe again
    retries whatever did not finish.
-4. **Open results folder** reveals `<name>.srt` and `<name>.txt`. If a
+5. **Open results folder** reveals `<name>.srt` and `<name>.txt`. If a
    transcript with that name already exists, the new one is written as
    `<name>-2.srt` instead of overwriting it.
 
@@ -70,6 +76,7 @@ chosen model and output folder back into that file, keeping your comments.
 | --- | --- |
 | `OPENROUTER_API_KEY` | required |
 | `OPENROUTER_MODEL` | default model; also saved when you pick one |
+| `TRANSCRIBE_SPEED` | playback factor sent to the model, default `1`; also saved when you change it |
 | `TRANSCRIBE_LANGUAGE` | ISO-639-1 hint, empty = auto-detect |
 | `TRANSCRIBE_CHUNK_SECONDS` | target chunk length, default 600 |
 | `TRANSCRIBE_OUTPUT_DIR` | where results go, empty = next to the source |
@@ -83,9 +90,14 @@ the recording leaves your machine. Each run logs the returned cost per chunk;
 the log view shows the total when a run finishes. Nothing else is sent, and the
 program keeps no copy of the audio.
 
-OpenRouter caps a single request at 25 MB. At the default 64 kbit/s mono, ten
-minutes is about 4.8 MB, so the default chunking stays clear of the limit even
-for multi-hour recordings.
+Providers bill by audio second, so the playback factor is a direct discount:
+2× costs half, and the only price is accuracy on very fast or overlapping
+speech. The factor is saved with the other settings.
+
+OpenRouter caps a single request at 25 MB, and base64 adds a third on top. Ten
+minutes of 16 kHz mono FLAC is about 2–4 MB, so the default chunking stays clear
+of the limit; a span that would exceed 17 MB in memory is split in half and sent
+as two requests rather than failing.
 
 ## Building
 
@@ -138,6 +150,7 @@ ffmpeg is installed; to include them, either install ffmpeg or point
 | `ffmpeg could not be obtained` | Both mirrors are unreachable. Install ffmpeg manually (`winget install Gyan.FFmpeg`, `scoop install ffmpeg`, or a zip in `C:\ffmpeg\bin`) and restart. |
 | `no audio stream` | The file is video-only or the container is broken; check that it plays elsewhere. |
 | Empty transcript | The chosen model does not really support audio, even if it advertises it. Pick a Whisper model. |
+| `Provider could not process the audio input` or `unsupported or malformed audio` | The model's backend refused the container. The program retries that chunk as FLAC, MP3, WAV and raw PCM before giving up; when all four are refused, switch to another model. |
 | `400`/`422` from the API | A chunk was rejected, usually a rate limit or size limit. The span is logged and skipped; lower `TRANSCRIBE_CHUNK_SECONDS` if it repeats. |
 
 ## How it works
@@ -159,8 +172,15 @@ Design notes:
   installer.
 - ffmpeg is only used through its command line, so a user-installed build and a
   downloaded static build behave identically.
-- Each chunk is a 64 kbit/s mono MP3 held in memory: small enough to fit in a
-  JSON body, and every supported model accepts it.
+- Each chunk is exported to memory as FLAC (lossless, and decodable by every
+  provider audio stack), then MP3, then WAV, then raw 16-bit PCM for backends
+  that want samples rather than a container. A provider that answers
+  `unsupported or malformed audio` is retried with the next encoding for that
+  chunk only; if all four are refused the error says the model cannot take the
+  audio, which is a model problem rather than a file problem.
+- The playback factor is an `atempo` chain (2× → `atempo=2`, 3× →
+  `atempo=2,atempo=1.5`), applied while cutting the chunk, so no extra pass over
+  the file is needed.
 - Requests use OpenRouter's documented `input_audio` JSON shape with
   `verbose_json` segments, which is what the audio-transcription endpoint
   accepts for base64 audio. Fallbacks cover providers that answer with plain
@@ -169,8 +189,27 @@ Design notes:
 ## How ffmpeg is obtained
 
 An existing install always wins; the program never downloads over one it can
-use. The search order is `FFMPEG_PATH`, `ffmpeg.exe` next to the program and in
-`ffmpeg\bin`, then `PATH`, then `%LOCALAPPDATA%\cloudtranscribe\ffmpeg`.
+use. In order, it looks at:
+
+1. `FFMPEG_PATH`, if set.
+2. `ffmpeg.exe` on `PATH`.
+3. Next to the program, in `bin\`, and in `ffmpeg\bin\`.
+4. `%LOCALAPPDATA%\cloudtranscribe\ffmpeg` (a copy this program downloaded
+   earlier).
+5. Common install directories: `C:\ffmpeg`, `C:\ffmpeg\bin`,
+   `%ProgramFiles%\ffmpeg`, `%ProgramFiles%\ffmpeg\bin`,
+   `%LOCALAPPDATA%\Programs\ffmpeg\bin`, `%LOCALAPPDATA%\Microsoft\WinGet\Links`,
+   the scoop shims directory, and `C:\ProgramData\chocolatey\bin`.
+6. Versioned package-manager folders, matched with a wildcard:
+   `%LOCALAPPDATA%\Microsoft\WinGet\Packages\Gyan.FFmpeg*\ffmpeg*\bin`,
+   `%LOCALAPPDATA%\Microsoft\WinGet\Packages\BtbN.FFmpeg*\ffmpeg*\bin`,
+   `%USERPROFILE%\scoop\apps\ffmpeg*\current\bin`, and
+   `%ProgramData%\chocolatey\lib\ffmpeg*\tools\ffmpeg*\bin`.
+7. The folders video players are installed in, which is where ffmpeg.exe ends up
+   when a guide names a VLC directory: VLC's own `InstallDir` from
+   `HKCU`/`HKLM\Software\VideoLAN\VLC` (the lookup VLC does for itself),
+   `%ProgramFiles%\VideoLAN\VLC`, the same under `Program Files (x86)`, and
+   `%APPDATA%\vlc` with its `plugins` folder.
 
 Only when none of those exists does it download a static build, trying three
 hosts in order and keeping the first that answers:

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -168,67 +169,123 @@ func (i *Install) Silences(ctx context.Context, file string, noiseDB, minSilence
 	return ParseSilenceEnds(stderr), nil
 }
 
-// ExtractChunk decodes one span of the input and returns compressed audio bytes
-// plus the format name to send to the API. Nothing touches the filesystem:
-// ffmpeg writes to its stdout.
-//
-// Audio is downmixed to mono 16 kHz, which is what speech models expect and
-// keeps a ten minute chunk around 5 MB.
-func (i *Install) ExtractChunk(ctx context.Context, file string, start, duration float64) ([]byte, string, error) {
-	type encoding struct {
-		format string
-		codec  []string
-	}
-	encodings := []encoding{
-		{"mp3", []string{"-c:a", "libmp3lame", "-b:a", "64k", "-f", "mp3"}},
-		// Some builds ship without libmp3lame; AAC/ADTS is accepted by the API.
-		{"aac", []string{"-c:a", "aac", "-b:a", "96k", "-f", "adts"}},
-	}
-
-	var lastErr error
-	for attempt, enc := range encodings {
-		args := []string{"-hide_banner", "-nostdin", "-nostats", "-loglevel", "error"}
-		if start > 0 {
-			// Input seeking keeps chunk extraction fast; audio seeking is
-			// sample accurate in current ffmpeg releases.
-			args = append(args, "-ss", strconv.FormatFloat(start, 'f', 3, 64))
-		}
-		args = append(args, "-i", file)
-		if duration > 0 {
-			args = append(args, "-t", strconv.FormatFloat(duration, 'f', 3, 64))
-		}
-		args = append(args,
-			"-map", "0:a:0", "-vn", "-sn", "-dn",
-			"-ac", "1", "-ar", "16000",
-		)
-		args = append(args, enc.codec...)
-		args = append(args, "pipe:1")
-
-		out, stderr, err := i.run(ctx, args...)
-		if err == nil && len(out) > 0 {
-			return out, enc.format, nil
-		}
-		if err == nil {
-			err = fmt.Errorf("ffmpeg produced no audio for this span")
-		}
-		lastErr = fmt.Errorf("%s encoding failed: %w", enc.format, err)
-
-		// Only a missing encoder justifies trying the next encoding; any other
-		// failure (bad file, no audio stream) would fail identically.
-		if attempt+1 < len(encodings) && !missingEncoder(stderr) {
-			return nil, "", lastErr
-		}
-	}
-	return nil, "", lastErr
+// AudioFormat is one container and codec combination that can be sent to the
+// API. Name is the value for input_audio.format and must match the bytes.
+type AudioFormat struct {
+	Name string
+	Ext  string
+	// Args are ffmpeg's output options for this container.
+	Args []string
 }
 
-func missingEncoder(stderr string) bool {
-	s := strings.ToLower(stderr)
-	return strings.Contains(s, "unknown encoder") ||
-		strings.Contains(s, "encoder not found") ||
-		strings.Contains(s, "unknown codec") ||
-		strings.Contains(s, "requested output format") ||
-		strings.Contains(s, "experimental")
+// AudioFormats lists the encodings to offer the API, in the order they are
+// tried. Every one is mono, 16 kHz, which is what speech models expect.
+//
+// FLAC comes first: it is lossless and decodable by every provider audio stack
+// (it is what Python's soundfile, ffmpeg and the Riva containers all handle), so
+// it is the least likely to be called "malformed audio". MP3 follows because
+// some gateways accept nothing else and it keeps uploads smaller, and WAV is
+// the universal third try. Raw 16-bit PCM comes last because that is what
+// Riva-based backends (NVIDIA's among them) decode most directly, and it costs
+// nothing unless the three containers were refused.
+func AudioFormats() []AudioFormat {
+	return []AudioFormat{
+		{Name: "flac", Ext: "flac", Args: []string{"-c:a", "flac", "-compression_level", "8", "-f", "flac"}},
+		{Name: "mp3", Ext: "mp3", Args: []string{"-c:a", "libmp3lame", "-b:a", "64k", "-f", "mp3"}},
+		{Name: "wav", Ext: "wav", Args: []string{"-c:a", "pcm_s16le", "-f", "wav"}},
+		{Name: "pcm16", Ext: "pcm", Args: []string{"-c:a", "pcm_s16le", "-f", "s16le"}},
+	}
+}
+
+// FindAudioFormat returns the named encoding, and the first one when the name
+// is unknown.
+func FindAudioFormat(name string) AudioFormat {
+	formats := AudioFormats()
+	for _, f := range formats {
+		if f.Name == name {
+			return f
+		}
+	}
+	return formats[0]
+}
+
+// ExtractChunk decodes one span of the input and returns the audio bytes in the
+// requested format. Nothing touches the filesystem: ffmpeg writes to stdout.
+//
+// speed above 1 shortens the clip with atempo, which compresses time without
+// changing pitch. The API bills by audio seconds, so a 2× speed halves the cost
+// of every chunk.
+func (i *Install) ExtractChunk(ctx context.Context, file string, start, duration float64, format AudioFormat, speed float64) ([]byte, error) {
+	args := []string{"-hide_banner", "-nostdin", "-nostats", "-loglevel", "error"}
+	if start > 0 {
+		// Input seeking keeps chunk extraction fast; audio seeking is sample
+		// accurate in current ffmpeg releases.
+		args = append(args, "-ss", strconv.FormatFloat(start, 'f', 3, 64))
+	}
+	if duration > 0 {
+		// -t before -i limits how much of the source is read, not how much
+		// output is produced. That distinction matters with atempo: as an
+		// output option it would keep reading source until it had duration
+		// seconds of sped-up audio, which silently doubles the billed span.
+		args = append(args, "-t", strconv.FormatFloat(duration, 'f', 3, 64))
+	}
+	args = append(args, "-i", file)
+	args = append(args,
+		"-map", "0:a:0", "-vn", "-sn", "-dn",
+		"-ac", "1", "-ar", "16000",
+	)
+	if filter := tempoFilter(speed); filter != "" {
+		args = append(args, "-af", filter)
+	}
+	args = append(args, format.Args...)
+	args = append(args, "pipe:1")
+
+	out, stderr, err := i.run(ctx, args...)
+	if err != nil {
+		return nil, fmt.Errorf("%s encoding failed: %w (%s)", format.Name, err, detail(stderr))
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%s encoding produced no audio for this span (%s)", format.Name, detail(stderr))
+	}
+	return out, nil
+}
+
+// detail renders ffmpeg's complaint as one short line, so a failure explains
+// itself instead of pointing at an exit code.
+func detail(stderr string) string {
+	s := strings.TrimSpace(stderr)
+	if s == "" {
+		return "no diagnostics"
+	}
+	if i := strings.IndexAny(s, "\r\n"); i >= 0 {
+		s = strings.TrimSpace(s[:i])
+	}
+	if len(s) > 200 {
+		s = s[:200] + "…"
+	}
+	return s
+}
+
+// tempoFilter renders the atempo chain for a playback speed. One atempo stage
+// accepts 0.5–2.0, so larger factors are applied in stages: 3× becomes
+// atempo=2,atempo=1.5.
+func tempoFilter(speed float64) string {
+	if !(speed > 0) || math.Abs(speed-1) < 1e-9 {
+		return ""
+	}
+
+	remaining := speed
+	var stages []string
+	for remaining > 2 && len(stages) < 8 {
+		stages = append(stages, "atempo=2")
+		remaining /= 2
+	}
+	for remaining < 0.5 && len(stages) < 8 {
+		stages = append(stages, "atempo=0.5")
+		remaining /= 0.5
+	}
+	stages = append(stages, fmt.Sprintf("atempo=%.5g", remaining))
+	return strings.Join(stages, ",")
 }
 
 // run executes ffmpeg and returns stdout, stderr and the exit status.

@@ -143,13 +143,42 @@ func TestExtractBinariesRejectsArchiveWithoutFFmpeg(t *testing.T) {
 	}
 }
 
-func TestMissingEncoder(t *testing.T) {
-	stderr := "Unknown encoder 'libmp3lame'"
-	if !missingEncoder(stderr) {
-		t.Error("missing encoder was not recognised")
+func TestTempoFilterStages(t *testing.T) {
+	// One atempo stage only accepts 0.5–2.0, so larger factors need a chain.
+	cases := map[float64]string{
+		1:    "",
+		0:    "",
+		2:    "atempo=2",
+		1.5:  "atempo=1.5",
+		3:    "atempo=2,atempo=1.5",
+		4:    "atempo=2,atempo=2",
+		0.75: "atempo=0.75",
 	}
-	if missingEncoder("Error opening input file") {
-		t.Error("unrelated error reported a missing encoder")
+	for speed, want := range cases {
+		if got := tempoFilter(speed); got != want {
+			t.Errorf("tempoFilter(%v) = %q, want %q", speed, got, want)
+		}
+	}
+}
+
+func TestAudioFormatsStartWithLossless(t *testing.T) {
+	formats := AudioFormats()
+	if len(formats) == 0 {
+		t.Fatal("no audio formats configured")
+	}
+	if formats[0].Name != "flac" {
+		t.Errorf("first format is %q, want flac, the container most providers decode", formats[0].Name)
+	}
+	for _, f := range formats {
+		if len(f.Args) == 0 {
+			t.Errorf("format %q has no ffmpeg arguments", f.Name)
+		}
+		if got := FindAudioFormat(f.Name); got.Name != f.Name {
+			t.Errorf("FindAudioFormat(%q) = %q", f.Name, got.Name)
+		}
+	}
+	if got := FindAudioFormat("nope"); got.Name != formats[0].Name {
+		t.Errorf("FindAudioFormat(unknown) = %q, want the first format", got.Name)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -214,5 +215,107 @@ func TestJobKeepsGoingAfterOneFailedSpan(t *testing.T) {
 	}
 	if _, err := os.Stat(result.SRTPath); err != nil {
 		t.Errorf("transcript was not written: %v", err)
+	}
+}
+
+// TestJobRetriesRejectedEncoding reproduces the failure a Riva-backed model
+// reports — "unsupported or malformed audio" for the first container — and
+// checks that the next encoding is used without losing the chunk. It also runs
+// at 2x, so the timestamps the model reports for the shortened clip must be
+// stretched back onto the original timeline.
+func TestJobRetriesRejectedEncoding(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping ffmpeg integration test in short mode")
+	}
+	ctx := context.Background()
+
+	install, ok := ffmpeg.Resolve(ctx, "")
+	if !ok {
+		t.Skip("ffmpeg is not installed; skipping the end-to-end test")
+	}
+
+	dir := t.TempDir()
+	sample := filepath.Join(dir, "talk.wav")
+	cmd := exec.CommandContext(ctx, install.FFmpeg,
+		"-hide_banner", "-loglevel", "error", "-nostdin",
+		"-f", "lavfi", "-i", "sine=frequency=300:duration=20",
+		"-y", sample)
+	executil.Hide(cmd)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("could not build the sample file: %v\n%s", err, out)
+	}
+
+	var (
+		requests int32
+		mu       sync.Mutex
+		formats  []string
+		payloads []int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		raw, _ := io.ReadAll(r.Body)
+		var body struct {
+			InputAudio struct {
+				Data   string `json:"data"`
+				Format string `json:"format"`
+			} `json:"input_audio"`
+		}
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Errorf("request is not JSON: %v", err)
+			return
+		}
+		mu.Lock()
+		formats = append(formats, body.InputAudio.Format)
+		payloads = append(payloads, len(body.InputAudio.Data))
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if body.InputAudio.Format == "flac" {
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, `{"error":{"message":"Provider could not process the audio input (unsupported or malformed audio)","code":400}}`)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"text": "sped up",
+			"segments": []map[string]any{
+				{"id": 0, "start": 1.0, "end": 2.0, "text": "at double speed"},
+			},
+			"usage": map[string]any{"cost": 0.00001},
+		})
+	}))
+	defer srv.Close()
+
+	client := openrouter.New("test-key")
+	client.BaseURL = srv.URL
+
+	job := &Job{FFmpeg: install, Client: client}
+	result, err := job.Run(ctx, Input{Path: sample}, Options{
+		Model: "nvidia/nemotron-test",
+		Speed: 2,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(formats) != 2 {
+		t.Fatalf("formats tried = %v, want flac then mp3", formats)
+	}
+	if formats[0] != "flac" || formats[1] != "mp3" {
+		t.Errorf("formats tried = %v, want flac then mp3", formats)
+	}
+	if len(result.Failed) != 0 {
+		t.Errorf("the chunk failed despite a working fallback: %v", result.Failed)
+	}
+
+	// The model saw 2 seconds of audio and reported 1s..2s, which is 2s..4s of
+	// the recording.
+	srt, err := os.ReadFile(result.SRTPath)
+	if err != nil {
+		t.Fatalf("reading the transcript: %v", err)
+	}
+	if !strings.Contains(string(srt), "00:00:02,000 --> 00:00:04,000") {
+		t.Errorf("timestamps were not stretched back to the original timeline:\n%s", srt)
 	}
 }
