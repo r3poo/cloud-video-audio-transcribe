@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -85,9 +86,12 @@ func TestWriteOutputs(t *testing.T) {
 	}
 
 	cues := []subtitle.Cue{{Start: 0, End: 1, Text: "hello"}}
-	srt, txt, err := writeOutputs(input, "", cues, []string{"hello"})
+	srt, txt, note, err := writeOutputs(input, "", cues, []string{"hello"})
 	if err != nil {
 		t.Fatalf("writeOutputs: %v", err)
+	}
+	if note != "" {
+		t.Errorf("note = %q, want none for a writable folder", note)
 	}
 	if srt != filepath.Join(dir, "talk.srt") || txt != filepath.Join(dir, "talk.txt") {
 		t.Errorf("paths = %q, %q, want them next to the input", srt, txt)
@@ -118,12 +122,18 @@ func TestWriteOutputsNeverOverwrites(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srt, txt, err := writeOutputs(input, "", []subtitle.Cue{{Start: 0, End: 1, Text: "hi"}}, nil)
+	srt, txt, note, err := writeOutputs(input, "", []subtitle.Cue{{Start: 0, End: 1, Text: "hi"}}, nil)
 	if err != nil {
 		t.Fatalf("writeOutputs: %v", err)
 	}
+	if note != "" {
+		t.Errorf("note = %q, want none", note)
+	}
 	if srt != filepath.Join(dir, "talk (2).srt") || txt != filepath.Join(dir, "talk (2).txt") {
 		t.Errorf("paths = %q, %q, want the numbered pair", srt, txt)
+	}
+	if note != "" {
+		t.Errorf("note = %q, want none: the pair fit under a free name", note)
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "talk.srt"))
 	if err != nil {
@@ -142,9 +152,12 @@ func TestWriteOutputsCreatesOutputDir(t *testing.T) {
 	}
 	out := filepath.Join(dir, "new", "nested")
 
-	srt, _, err := writeOutputs(input, out, nil, nil)
+	srt, _, note, err := writeOutputs(input, out, nil, nil)
 	if err != nil {
 		t.Fatalf("writeOutputs: %v", err)
+	}
+	if note != "" {
+		t.Errorf("note = %q, want none", note)
 	}
 	if filepath.Dir(srt) != out {
 		t.Errorf("srt written to %q, want %q", filepath.Dir(srt), out)
@@ -320,5 +333,87 @@ func TestTooLarge(t *testing.T) {
 				t.Errorf("tooLarge(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+// The Windows failure this covers: a name that Stat cannot inspect (an ACL can
+// hide a file from a directory listing) still refuses the write, and the whole
+// transcript used to be thrown away after the API had already been paid.
+func TestWriteOutputsSkipsANameItCannotInspect(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "talk.wav")
+	if err := os.WriteFile(input, []byte("fake"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A directory in place of the subtitle file: Stat succeeds, so the name is
+	// plainly taken - the case that used to end in "Access is denied".
+	if err := os.Mkdir(filepath.Join(dir, "talk.srt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	srt, txt, note, err := writeOutputs(input, "", []subtitle.Cue{{Start: 0, End: 1, Text: "hi"}}, []string{"hi"})
+	if err != nil {
+		t.Fatalf("writeOutputs: %v", err)
+	}
+	if srt != filepath.Join(dir, "talk (2).srt") || txt != filepath.Join(dir, "talk (2).txt") {
+		t.Errorf("paths = %q, %q, want the numbered pair", srt, txt)
+	}
+	if note != "" {
+		t.Errorf("note = %q, want none: the pair fit under a free name", note)
+	}
+	if _, err := os.Stat(srt); err != nil {
+		t.Errorf("subtitle file was not written: %v", err)
+	}
+}
+
+func TestTakenTreatsUnreadablePathsAsOccupied(t *testing.T) {
+	dir := t.TempDir()
+	free := filepath.Join(dir, "free.srt")
+	if taken(free) {
+		t.Error("a name that does not exist should not be taken")
+	}
+	if err := os.WriteFile(free, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !taken(free) {
+		t.Error("an existing file should be taken")
+	}
+}
+
+func TestWriteOutputsFallsBackWhenEveryNameIsRefused(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory permissions do not deny writes the same way on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	dir := t.TempDir()
+	input := filepath.Join(dir, "talk.wav")
+	if err := os.WriteFile(input, []byte("fake"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fallbackBase := filepath.Join(dir, "config")
+	t.Setenv("XDG_CONFIG_HOME", fallbackBase)
+	t.Setenv("APPDATA", fallbackBase)
+	out := filepath.Join(dir, "locked")
+	if err := os.Mkdir(out, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(out, 0o755) })
+
+	srt, txt, note, err := writeOutputs(input, out, []subtitle.Cue{{Start: 0, End: 1, Text: "hi"}}, []string{"hi"})
+	if err != nil {
+		t.Fatalf("a read-only media folder must not lose the transcript: %v", err)
+	}
+	if note == "" {
+		t.Error("the move to the fallback folder should be reported in the note")
+	}
+	for _, path := range []string{srt, txt} {
+		if !strings.HasPrefix(path, fallbackBase) {
+			t.Errorf("%s is not under the fallback folder %s", path, fallbackBase)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("fallback file missing: %v", err)
+		}
 	}
 }

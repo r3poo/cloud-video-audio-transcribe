@@ -153,6 +153,8 @@ ffmpeg is installed; to include them, either install ffmpeg or point
 | `Provider could not process the audio input` or `unsupported or malformed audio` | Two different problems share this one message: a container the route cannot decode, and a *request option* it cannot honour (typically timestamped output). The program tries the plain request shape on the same bytes first — no re-encode — and only then walks the container list. If all four containers fail in both shapes, the model does not really support audio — switch to another one. |
 | `400`/`422` from the API | A chunk was rejected, usually a rate limit or size limit. The span is logged and skipped; lower `TRANSCRIBE_CHUNK_SECONDS` if it repeats. |
 | `413` or `payload too large` | The chunk outgrew the gateway's inline cap. It is halved and re-sent automatically; the guard that measures chunks usually prevents this, so it means the estimate was wrong for that file. |
+| A model refuses everything, on every file | `nvidia/nemotron-3.5-transcribe` currently answers `400` for every container, with and without timestamps, on requests that `nvidia/parakeet-tdt-0.6b-v3` and `openai/whisper-large-v3-turbo` accept unchanged. It is a fault on the route, not in the file: switch models. The program stops the file after the first span's ladder instead of paying for the same rejections on every chunk. |
+| `Access is denied` when writing the `.srt` | The media folder refuses that name. The program now steps to `name (2).srt`, and if no name in the folder works it writes to `%LOCALAPPDATA%\cloudtranscribe\transcripts` and says so in the log, so a paid-for transcript is never lost. |
 
 ## How it works
 

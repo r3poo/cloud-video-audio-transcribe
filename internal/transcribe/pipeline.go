@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -105,6 +106,9 @@ type Result struct {
 	// Failed lists spans that could not be transcribed. Results are still
 	// written so a long job is not lost to one bad request.
 	Failed []chunk.Span
+	// Note carries something the user should know about a successful run, such
+	// as the transcript having been saved away from the media folder.
+	Note string
 }
 
 // Job binds the dependencies needed for a run.
@@ -202,6 +206,13 @@ func (j *Job) Run(ctx context.Context, input Input, opts Options) (*Result, erro
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
+			// A model that refused all four containers for this span will refuse
+			// them for every other span too. Stop here rather than spending the
+			// same four rejections per chunk: the user's next move is the model
+			// list, not the rest of the file.
+			if errors.Is(err, ErrModelRejectsAudio) {
+				return nil, err
+			}
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -229,12 +240,13 @@ func (j *Job) Run(ctx context.Context, input Input, opts Options) (*Result, erro
 		Fraction: 1,
 	})
 
-	srtPath, textPath, err := writeOutputs(input.Path, opts.OutputDir, cues, texts)
+	srtPath, textPath, note, err := writeOutputs(input.Path, opts.OutputDir, cues, texts)
 	if err != nil {
 		return nil, err
 	}
 	result.SRTPath = srtPath
 	result.TextPath = textPath
+	result.Note = note
 	result.AudioFormat = preferred
 	result.TimestampsEstimated = !verbose
 	result.Segments = len(subtitle.Normalize(cues))
@@ -282,6 +294,11 @@ const maxPayloadBytes = 17 << 20
 // maxSplitDepth bounds the halving, so a pathological file cannot explode into
 // hundreds of requests: 600s at depth 0 reaches 75s at depth 3.
 const maxSplitDepth = 3
+
+// exhaustedAudioError marks a model that refused every container for one span.
+// Every later span would repeat the same four rejections on the same file, so
+// the run stops instead of paying for them.
+var ErrModelRejectsAudio = errors.New("the model refused every audio container")
 
 // chunkPiece is what one span, or one half of a split span, contributes.
 type chunkPiece struct {
@@ -393,8 +410,8 @@ func (j *Job) transcribeSpan(ctx context.Context, path string, span chunk.Span, 
 	}
 	// Every container was refused, so this model cannot take the audio at all
 	// and the honest advice is to switch models rather than to retry.
-	return nil, fmt.Errorf("the provider rejected %s audio for %s; try a different transcription model — %w",
-		strings.Join(attempted, ", "), span, lastErr)
+	return nil, fmt.Errorf("%w: %s rejected %s for %s — try a different transcription model: %w",
+		ErrModelRejectsAudio, opts.Model, strings.Join(attempted, ", "), span, lastErr)
 }
 
 // orderedFormats puts the container that worked last time in front. Preference
@@ -500,42 +517,96 @@ func trimFloat(v float64) string {
 }
 
 // writeOutputs stores the .srt and .txt next to the source, never overwriting
-// an existing transcript.
-func writeOutputs(inputPath, outputDir string, cues []subtitle.Cue, texts []string) (srtPath, textPath string, err error) {
+// an existing transcript. The transcript has already been paid for, so if the
+// media folder refuses the files (a read-only or ACL-protected volume is the
+// usual reason) they go to the app's own data folder instead of being lost.
+func writeOutputs(inputPath, outputDir string, cues []subtitle.Cue, texts []string) (srtPath, textPath, note string, err error) {
 	dir := outputDir
 	if dir == "" {
 		dir = filepath.Dir(inputPath)
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", "", fmt.Errorf("create output folder: %w", err)
+		return "", "", "", fmt.Errorf("create output folder: %w", err)
 	}
 	base := strings.TrimSuffix(filepath.Base(inputPath), filepath.Ext(inputPath))
+	srt := []byte(subtitle.FormatSRT(cues))
+	txt := []byte(formatText(texts))
 
-	srtPath = filepath.Join(dir, base+".srt")
-	textPath = filepath.Join(dir, base+".txt")
-	// Keep the pair together: if either name is taken, move both to
-	// "name (2).srt" / "name (2).txt".
-	for i := 2; exists(srtPath) || exists(textPath); i++ {
-		candidate := filepath.Join(dir, fmt.Sprintf("%s (%d)", base, i))
-		srtPath = candidate + ".srt"
-		textPath = candidate + ".txt"
-		if i > 1000 {
-			break
+	srtPath, textPath, err = writePair(dir, base, srt, txt)
+	if err == nil {
+		return srtPath, textPath, "", nil
+	}
+
+	// Second chance: the app already writes its settings here, so the folder is
+	// known to be writable for this user.
+	if fallback, ferr := fallbackDir(); ferr == nil && fallback != dir {
+		if err2 := os.MkdirAll(fallback, 0o755); err2 == nil {
+			if fp1, fp2, err3 := writePair(fallback, base, srt, txt); err3 == nil {
+				return fp1, fp2, fmt.Sprintf("The media folder refused the file (%v), so the transcript went to %s instead.", err, fallback), nil
+			}
 		}
 	}
-
-	if err := os.WriteFile(srtPath, []byte(subtitle.FormatSRT(cues)), 0o644); err != nil {
-		return "", "", fmt.Errorf("write %s: %w", srtPath, err)
-	}
-	if err := os.WriteFile(textPath, []byte(formatText(texts)), 0o644); err != nil {
-		return "", "", fmt.Errorf("write %s: %w", textPath, err)
-	}
-	return srtPath, textPath, nil
+	return "", "", "", err
 }
 
-func exists(path string) bool {
+// writePair writes both files under the first name that accepts them.
+func writePair(dir, base string, srt, txt []byte) (srtPath, textPath string, err error) {
+	var (
+		lastErr  error
+		failures int
+	)
+	for i := 1; i <= 1000; i++ {
+		stem := base
+		if i > 1 {
+			stem = fmt.Sprintf("%s (%d)", base, i)
+		}
+		srtPath = filepath.Join(dir, stem+".srt")
+		textPath = filepath.Join(dir, stem+".txt")
+		if taken(srtPath) || taken(textPath) {
+			continue
+		}
+		if err := os.WriteFile(srtPath, srt, 0o644); err != nil {
+			lastErr = fmt.Errorf("write %s: %w", srtPath, err)
+			if failures++; failures >= 5 {
+				break
+			}
+			continue
+		}
+		if err := os.WriteFile(textPath, txt, 0o644); err != nil {
+			lastErr = fmt.Errorf("write %s: %w", textPath, err)
+			// A subtitle file with no matching text file is worse than starting
+			// over under the next name.
+			os.Remove(srtPath)
+			if failures++; failures >= 5 {
+				break
+			}
+			continue
+		}
+		return srtPath, textPath, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no free file name for %s in %s", base, dir)
+	}
+	return "", "", lastErr
+}
+
+// fallbackDir is where transcripts go when the media folder is not writable.
+func fallbackDir() (string, error) {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "cloudtranscribe", "transcripts"), nil
+}
+
+// taken reports whether a name already holds something, or cannot be inspected
+// at all. A path that Stat cannot even read is treated as occupied: on Windows an
+// ACL can deny access to a file while hiding it from the directory listing, and
+// writing over it then fails with "access is denied" instead of a clear
+// conflict. Skipping it keeps the earlier transcript intact.
+func taken(path string) bool {
 	_, err := os.Stat(path)
-	return err == nil
+	return err == nil || !errors.Is(err, fs.ErrNotExist)
 }
 
 // formatText renders a readable transcript: one paragraph per chunk, wrapped at

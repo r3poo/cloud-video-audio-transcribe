@@ -3,6 +3,7 @@ package transcribe
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -520,5 +521,64 @@ func TestJobSplitsWhenTheGatewaySaysTooLarge(t *testing.T) {
 	// nothing.
 	if payloads[1] >= payloads[0] || payloads[2] >= payloads[0] {
 		t.Errorf("halves were not smaller than the refused span: %v", payloads)
+	}
+}
+
+// TestJobStopsAfterTheModelRefusesEveryContainer covers the failure the user hit
+// with nvidia/nemotron-3.5-transcribe: every container rejected for every span.
+// The first span costs one ladder of requests; the rest of the file must not
+// repeat it, because the answer is a different model, not a different chunk.
+func TestJobStopsAfterTheModelRefusesEveryContainer(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping ffmpeg integration test in short mode")
+	}
+	ctx := context.Background()
+
+	install, ok := ffmpeg.Resolve(ctx, "")
+	if !ok {
+		t.Skip("ffmpeg is not installed; skipping the end-to-end test")
+	}
+
+	dir := t.TempDir()
+	sample := filepath.Join(dir, "talk.wav")
+	cmd := exec.CommandContext(ctx, install.FFmpeg,
+		"-hide_banner", "-loglevel", "error", "-nostdin",
+		"-f", "lavfi", "-i", "sine=frequency=300:duration=180",
+		"-y", sample)
+	executil.Hide(cmd)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("could not build the sample file: %v\n%s", err, out)
+	}
+
+	var requests int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"error":{"code":400,"message":"Provider could not process the audio input (unsupported or malformed audio)"}}`)
+	}))
+	defer srv.Close()
+
+	client := openrouter.New("test-key")
+	client.BaseURL = srv.URL
+
+	client.MaxAttempts = 1
+	_, err := (&Job{FFmpeg: install, Client: client}).Run(ctx, Input{Path: sample}, Options{
+		Model:        "nvidia/nemotron-3.5-transcribe",
+		ChunkSeconds: 60,
+	})
+	if err == nil {
+		t.Fatal("want an error when the model refuses every container")
+	}
+	if !errors.Is(err, ErrModelRejectsAudio) {
+		t.Fatalf("error = %v, want it to wrap ErrModelRejectsAudio", err)
+	}
+	if !strings.Contains(err.Error(), "different transcription model") {
+		t.Errorf("error should point at the model list, got %q", err.Error())
+	}
+	// wav with timestamps, wav plain, mp3, flac, pcm16 — then nothing more.
+	if got := atomic.LoadInt32(&requests); got != 5 {
+		t.Errorf("sent %d requests, want 5 (one ladder, then stop)", got)
 	}
 }
