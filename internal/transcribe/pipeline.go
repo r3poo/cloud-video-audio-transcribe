@@ -271,10 +271,17 @@ func requestRefused(err error) bool {
 	return false
 }
 
-// maxPayloadBytes is the largest audio chunk sent in one request. OpenRouter
-// caps an inline payload at 25 MB and base64 adds a third, so this leaves room
-// to spare; a span that would exceed it is split.
+// maxPayloadBytes is the largest audio chunk sent in one request. Two ceilings
+// sit above it: OpenRouter rejects an inline base64 body past the 25 MB multipart
+// cap on every provider except OpenAI and Groq, and the providers themselves cap
+// uploads higher still (50 MiB on DeepInfra). Base64 adds a third to the size, so
+// 17 MiB of audio becomes a ~22.7 MiB body, which clears all three with room to
+// spare. A span that would exceed it is split before uploading.
 const maxPayloadBytes = 17 << 20
+
+// maxSplitDepth bounds the halving, so a pathological file cannot explode into
+// hundreds of requests: 600s at depth 0 reaches 75s at depth 3.
+const maxSplitDepth = 3
 
 // chunkPiece is what one span, or one half of a split span, contributes.
 type chunkPiece struct {
@@ -289,12 +296,29 @@ func (p *chunkPiece) merge(other *chunkPiece) {
 	p.cost += other.cost
 }
 
-// transcribeSpan extracts one span and sends it. Two failures have a defined
+// transcribeSpan extracts one span and sends it. Three failures have a defined
 // remedy: a provider that calls the audio malformed is answered with the next
-// encoding, and a payload that is too large for one request is halved.
+// encoding, a request shape that is refused is re-sent plain, and a payload that
+// is too large for one request is halved.
 func (j *Job) transcribeSpan(ctx context.Context, path string, span chunk.Span, language string, opts Options, preferred *string, verbose *bool, report func(Progress), depth int) (*chunkPiece, error) {
 	speed := opts.speedValue()
 	formats := orderedFormats(*preferred)
+
+	// split halves the span and transcribes each part, reusing the job's
+	// preferences so the half that worked first is tried first again.
+	canSplit := span.Duration() > 2*chunk.MinTarget && depth < maxSplitDepth
+	split := func() (*chunkPiece, error) {
+		mid := span.Start + span.Duration()/2
+		piece := &chunkPiece{}
+		for _, half := range []chunk.Span{{Start: span.Start, End: mid}, {Start: mid, End: span.End}} {
+			part, err := j.transcribeSpan(ctx, path, half, language, opts, preferred, verbose, report, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			piece.merge(part)
+		}
+		return piece, nil
+	}
 
 	var lastErr error
 	var attempted []string
@@ -311,17 +335,9 @@ func (j *Job) transcribeSpan(ctx context.Context, path string, span chunk.Span, 
 			return nil, fmt.Errorf("audio extraction failed for %s: %w", span, err)
 		}
 
-		if len(audio) > maxPayloadBytes && span.Duration() > 2*chunk.MinTarget && depth < 3 {
-			mid := span.Start + span.Duration()/2
-			piece := &chunkPiece{}
-			for _, half := range []chunk.Span{{Start: span.Start, End: mid}, {Start: mid, End: span.End}} {
-				part, err := j.transcribeSpan(ctx, path, half, language, opts, preferred, verbose, report, depth+1)
-				if err != nil {
-					return nil, err
-				}
-				piece.merge(part)
-			}
-			return piece, nil
+		// Cheaper to split than to upload something the gateway will reject.
+		if len(audio) > maxPayloadBytes && canSplit {
+			return split()
 		}
 
 		report(Progress{
@@ -350,6 +366,15 @@ func (j *Job) transcribeSpan(ctx context.Context, path string, span chunk.Span, 
 		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
+		}
+		// A size estimate can be wrong — an unexpected container, a provider
+		// with a lower cap than documented. Split rather than lose the span.
+		if tooLarge(err) && canSplit {
+			report(Progress{
+				Stage:   "uploading",
+				Message: fmt.Sprintf("%s was too large for one request · splitting it in half", span),
+			})
+			return split()
 		}
 		if !rejectsAudio(err) {
 			return nil, err
@@ -390,6 +415,26 @@ func orderedFormats(first string) []ffmpeg.AudioFormat {
 		return append(ordered, formats[i+1:]...)
 	}
 	return formats
+}
+
+// tooLarge reports whether the request was refused for its size, which is the
+// one failure that splitting the span fixes. Gateways answer 413, and providers
+// behind them phrase it their own way, so the text is checked as well.
+func tooLarge(err error) bool {
+	var apiErr *openrouter.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	if apiErr.StatusCode == http.StatusRequestEntityTooLarge {
+		return true
+	}
+	text := strings.ToLower(apiErr.Error())
+	for _, needle := range []string{"too large", "payload too", "exceeds the maximum", "file size"} {
+		if strings.Contains(text, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // rejectsAudio reports whether the provider refused the audio itself, which is

@@ -152,6 +152,7 @@ ffmpeg is installed; to include them, either install ffmpeg or point
 | Empty transcript | The chosen model does not really support audio, even if it advertises it. Pick a Whisper model. |
 | `Provider could not process the audio input` or `unsupported or malformed audio` | Two different problems share this one message: a container the route cannot decode, and a *request option* it cannot honour (typically timestamped output). The program tries the plain request shape on the same bytes first — no re-encode — and only then walks the container list. If all four containers fail in both shapes, the model does not really support audio — switch to another one. |
 | `400`/`422` from the API | A chunk was rejected, usually a rate limit or size limit. The span is logged and skipped; lower `TRANSCRIBE_CHUNK_SECONDS` if it repeats. |
+| `413` or `payload too large` | The chunk outgrew the gateway's inline cap. It is halved and re-sent automatically; the guard that measures chunks usually prevents this, so it means the estimate was wrong for that file. |
 
 ## How it works
 

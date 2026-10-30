@@ -300,3 +300,25 @@ func names(formats []ffmpeg.AudioFormat) []string {
 	}
 	return out
 }
+
+func TestTooLarge(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"413", &openrouter.APIError{StatusCode: 413, Message: "Request Entity Too Large"}, true},
+		{"provider wording", &openrouter.APIError{StatusCode: 400, Message: "File size exceeds the maximum allowed"}, true},
+		{"gateway wording", &openrouter.APIError{StatusCode: 400, Message: "payload too large for inline audio"}, true},
+		{"unrelated 400", &openrouter.APIError{StatusCode: 400, Message: "unsupported or malformed audio"}, false},
+		{"rate limited", &openrouter.APIError{StatusCode: 429, Message: "slow down"}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tooLarge(tc.err); got != tc.want {
+				t.Errorf("tooLarge(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}

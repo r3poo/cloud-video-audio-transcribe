@@ -433,3 +433,92 @@ func TestJobDropsTimestampsBeforeChangingEncoding(t *testing.T) {
 		t.Errorf("the chunk failed despite a working plain request: %v", result.Failed)
 	}
 }
+
+// TestJobSplitsWhenTheGatewaySaysTooLarge covers the payload guard being wrong:
+// a span that looked small enough is refused with 413. The span is halved and
+// the halves are uploaded, instead of the whole span being written off.
+func TestJobSplitsWhenTheGatewaySaysTooLarge(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping ffmpeg integration test in short mode")
+	}
+	ctx := context.Background()
+
+	install, ok := ffmpeg.Resolve(ctx, "")
+	if !ok {
+		t.Skip("ffmpeg is not installed; skipping the end-to-end test")
+	}
+
+	dir := t.TempDir()
+	sample := filepath.Join(dir, "long.wav")
+	cmd := exec.CommandContext(ctx, install.FFmpeg,
+		"-hide_banner", "-loglevel", "error", "-nostdin",
+		"-f", "lavfi", "-i", "sine=frequency=220:duration=90",
+		"-y", sample)
+	executil.Hide(cmd)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("could not build the sample file: %v\n%s", err, out)
+	}
+
+	// 90s of audio fits under the guard, so the first send is a whole span.
+	// Only the first request is refused; the two halves are accepted.
+	var (
+		requests int32
+		mu       sync.Mutex
+		payloads []int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&requests, 1)
+		raw, _ := io.ReadAll(r.Body)
+		var body struct {
+			InputAudio struct {
+				Data string `json:"data"`
+			} `json:"input_audio"`
+		}
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Errorf("request is not JSON: %v", err)
+			return
+		}
+		mu.Lock()
+		payloads = append(payloads, len(body.InputAudio.Data))
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			io.WriteString(w, `{"error":{"message":"Payload too large","code":413}}`)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"text":     "half a recording",
+			"segments": []map[string]any{{"id": 0, "start": 0, "end": 3, "text": "half a recording"}},
+		})
+	}))
+	defer srv.Close()
+
+	client := openrouter.New("test-key")
+	client.BaseURL = srv.URL
+	client.MaxAttempts = 1
+
+	result, err := (&Job{FFmpeg: install, Client: client}).Run(ctx, Input{Path: sample}, Options{Model: "test/whisper"})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(result.Failed) != 0 {
+		t.Errorf("the span was written off instead of split: %v", result.Failed)
+	}
+	// Spans counts the planned spans, so the split is only visible in the
+	// request log below.
+	if result.Segments == 0 {
+		t.Error("the halves produced no cues")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(payloads) != 3 {
+		t.Fatalf("requests = %d, want the refused upload plus two halves", len(payloads))
+	}
+	// Each half must carry less than the refused whole, or the split bought
+	// nothing.
+	if payloads[1] >= payloads[0] || payloads[2] >= payloads[0] {
+		t.Errorf("halves were not smaller than the refused span: %v", payloads)
+	}
+}
