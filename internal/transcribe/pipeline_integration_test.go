@@ -270,7 +270,7 @@ func TestJobRetriesRejectedEncoding(t *testing.T) {
 		mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
-		if body.InputAudio.Format == "flac" {
+		if body.InputAudio.Format == "wav" {
 			w.WriteHeader(http.StatusBadRequest)
 			io.WriteString(w, `{"error":{"message":"Provider could not process the audio input (unsupported or malformed audio)","code":400}}`)
 			return
@@ -300,10 +300,13 @@ func TestJobRetriesRejectedEncoding(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	if len(formats) != 2 {
-		t.Fatalf("formats tried = %v, want flac then mp3", formats)
+		t.Fatalf("formats tried = %v, want wav then mp3", formats)
 	}
-	if formats[0] != "flac" || formats[1] != "mp3" {
-		t.Errorf("formats tried = %v, want flac then mp3", formats)
+	if formats[0] != "wav" || formats[1] != "mp3" {
+		t.Errorf("formats tried = %v, want wav then mp3", formats)
+	}
+	if result.AudioFormat != "mp3" {
+		t.Errorf("result.AudioFormat = %q, want the accepted container", result.AudioFormat)
 	}
 	if len(result.Failed) != 0 {
 		t.Errorf("the chunk failed despite a working fallback: %v", result.Failed)

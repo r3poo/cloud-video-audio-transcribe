@@ -77,6 +77,7 @@ chosen model and output folder back into that file, keeping your comments.
 | `OPENROUTER_API_KEY` | required |
 | `OPENROUTER_MODEL` | default model; also saved when you pick one |
 | `TRANSCRIBE_SPEED` | playback factor sent to the model, default `1`; also saved when you change it |
+| `TRANSCRIBE_AUDIO_FORMAT` | container to try first (`wav`, `mp3`, `flac`, `pcm16`); written after a successful run |
 | `TRANSCRIBE_LANGUAGE` | ISO-639-1 hint, empty = auto-detect |
 | `TRANSCRIBE_CHUNK_SECONDS` | target chunk length, default 600 |
 | `TRANSCRIBE_OUTPUT_DIR` | where results go, empty = next to the source |
@@ -95,9 +96,8 @@ Providers bill by audio second, so the playback factor is a direct discount:
 speech. The factor is saved with the other settings.
 
 OpenRouter caps a single request at 25 MB, and base64 adds a third on top. Ten
-minutes of 16 kHz mono FLAC is about 2–4 MB, so the default chunking stays clear
-of the limit; a span that would exceed 17 MB in memory is split in half and sent
-as two requests rather than failing.
+minutes of 16 kHz mono WAV is about 19 MB, so a span that would exceed 17 MB in
+memory is split in half and sent as two requests rather than failing.
 
 ## Building
 
@@ -150,7 +150,7 @@ ffmpeg is installed; to include them, either install ffmpeg or point
 | `ffmpeg could not be obtained` | Both mirrors are unreachable. Install ffmpeg manually (`winget install Gyan.FFmpeg`, `scoop install ffmpeg`, or a zip in `C:\ffmpeg\bin`) and restart. |
 | `no audio stream` | The file is video-only or the container is broken; check that it plays elsewhere. |
 | Empty transcript | The chosen model does not really support audio, even if it advertises it. Pick a Whisper model. |
-| `Provider could not process the audio input` or `unsupported or malformed audio` | The model's backend refused the container. The program retries that chunk as FLAC, MP3, WAV and raw PCM before giving up; when all four are refused, switch to another model. |
+| `Provider could not process the audio input` or `unsupported or malformed audio` | The model's backend refused the container. The program retries that chunk as WAV, MP3, FLAC and raw PCM before giving up; when all four are refused, the model does not really support audio — switch to another one. |
 | `400`/`422` from the API | A chunk was rejected, usually a rate limit or size limit. The span is logged and skipped; lower `TRANSCRIBE_CHUNK_SECONDS` if it repeats. |
 
 ## How it works
@@ -172,12 +172,16 @@ Design notes:
   installer.
 - ffmpeg is only used through its command line, so a user-installed build and a
   downloaded static build behave identically.
-- Each chunk is exported to memory as FLAC (lossless, and decodable by every
-  provider audio stack), then MP3, then WAV, then raw 16-bit PCM for backends
-  that want samples rather than a container. A provider that answers
-  `unsupported or malformed audio` is retried with the next encoding for that
-  chunk only; if all four are refused the error says the model cannot take the
-  audio, which is a model problem rather than a file problem.
+- Each chunk is exported to memory and sent as WAV first, then MP3, FLAC and raw
+  16-bit PCM. OpenRouter publishes no per-model list of accepted containers —
+  only a global set with "wav is the safest default" — and the provider that
+  serves a given model documents its own subset (DeepInfra, which serves the
+  Nemotron transcription models, documents just mp3 and wav). A provider that
+  answers `unsupported or malformed audio` is therefore retried with the next
+  encoding for that chunk; if all four are refused the error says the model
+  cannot take the audio, which is a model problem rather than a file problem.
+  The container that worked is saved as `TRANSCRIBE_AUDIO_FORMAT` and tried
+  first next time.
 - The playback factor is an `atempo` chain (2× → `atempo=2`, 3× →
   `atempo=2,atempo=1.5`), applied while cutting the chunk, so no extra pass over
   the file is needed.

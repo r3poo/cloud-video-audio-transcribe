@@ -161,13 +161,23 @@ func TestTempoFilterStages(t *testing.T) {
 	}
 }
 
-func TestAudioFormatsStartWithLossless(t *testing.T) {
+func TestAudioFormatsStartWithWAV(t *testing.T) {
 	formats := AudioFormats()
 	if len(formats) == 0 {
 		t.Fatal("no audio formats configured")
 	}
-	if formats[0].Name != "flac" {
-		t.Errorf("first format is %q, want flac, the container most providers decode", formats[0].Name)
+	// WAV needs no decoder beyond a RIFF header, which is why OpenRouter calls it
+	// the safest default and why it heads the ladder.
+	if formats[0].Name != "wav" {
+		t.Errorf("first format is %q, want wav", formats[0].Name)
+	}
+	// Every entry must be distinguishable, since a rejection walks the list once.
+	seen := map[string]bool{}
+	for _, f := range formats {
+		if seen[f.Name] {
+			t.Errorf("format %q appears twice", f.Name)
+		}
+		seen[f.Name] = true
 	}
 	for _, f := range formats {
 		if len(f.Args) == 0 {

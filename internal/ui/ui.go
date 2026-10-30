@@ -32,6 +32,7 @@ const (
 	keyChunkSize = "TRANSCRIBE_CHUNK_SECONDS"
 	keyOutputDir = "TRANSCRIBE_OUTPUT_DIR"
 	keySpeed     = "TRANSCRIBE_SPEED"
+	keyFormat    = "TRANSCRIBE_AUDIO_FORMAT"
 )
 
 type app struct {
@@ -657,6 +658,9 @@ func (a *app) options() transcribe.Options {
 		}
 	}
 	opts.Speed = a.speedFactor()
+	// The container a provider accepted last time goes first, so a model that
+	// only takes one encoding does not repeat a rejection on every run.
+	opts.FirstFormat = a.env.Get(keyFormat)
 	if opts.OutputDir == "" {
 		opts.OutputDir = a.env.Get(keyOutputDir)
 	}
@@ -736,8 +740,9 @@ func (a *app) markDone(index int, result *transcribe.Result) {
 	a.btnOpen.SetEnabled(true)
 	a.appendLog("Wrote " + result.SRTPath)
 	a.appendLog("Wrote " + result.TextPath)
-	a.appendLog(fmt.Sprintf("Transcribed %s in %d part(s), %d cues%s",
-		humanDuration(result.Duration), result.Spans, result.Segments, costSuffix(result.CostUSD)))
+	a.appendLog(fmt.Sprintf("Transcribed %s in %d part(s), %d cues as %s audio%s",
+		humanDuration(result.Duration), result.Spans, result.Segments, result.AudioFormat, costSuffix(result.CostUSD)))
+	a.remember(keyFormat, result.AudioFormat)
 	if len(result.Failed) > 0 {
 		a.appendLog(fmt.Sprintf("Warning: %d part(s) of %s failed and are missing from the output.",
 			len(result.Failed), filepath.Base(result.SRTPath)))

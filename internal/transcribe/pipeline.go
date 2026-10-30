@@ -42,6 +42,10 @@ type Options struct {
 	// second, so 2 halves the cost of every chunk. Zero or out-of-range values
 	// mean normal speed.
 	Speed float64
+	// FirstFormat names the container to try before the rest of the ladder, so a
+	// model that only accepts one encoding does not pay for a rejection on every
+	// run. Empty means the built-in order.
+	FirstFormat string
 }
 
 // Speed limits. Below 0.5 speech drags, above 4 the models start dropping
@@ -92,6 +96,9 @@ type Result struct {
 	Segments int
 	// CostUSD is the sum reported by the API, when the provider reports cost.
 	CostUSD float64
+	// AudioFormat is the container the provider accepted, which is worth
+	// remembering: the next run can start with it.
+	AudioFormat string
 	// Failed lists spans that could not be transcribed. Results are still
 	// written so a long job is not lost to one bad request.
 	Failed []chunk.Span
@@ -169,9 +176,10 @@ func (j *Job) Run(ctx context.Context, input Input, opts Options) (*Result, erro
 		texts    []string
 		firstErr error
 	)
-	// formatIndex remembers the container the provider accepted, so a rejected
-	// encoding costs one retry for the first chunk instead of one per chunk.
-	formatIndex := 0
+	// preferred carries the container the provider accepted from one span to the
+	// next, so a rejection costs one retry for the whole job rather than one per
+	// chunk.
+	preferred := opts.FirstFormat
 
 	for idx, span := range spans {
 		if err := ctx.Err(); err != nil {
@@ -183,7 +191,7 @@ func (j *Job) Run(ctx context.Context, input Input, opts Options) (*Result, erro
 			j.report(p)
 		}
 
-		piece, err := j.transcribeSpan(ctx, input.Path, span, language, opts, &formatIndex, report, 0)
+		piece, err := j.transcribeSpan(ctx, input.Path, span, language, opts, &preferred, report, 0)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
@@ -221,6 +229,7 @@ func (j *Job) Run(ctx context.Context, input Input, opts Options) (*Result, erro
 	}
 	result.SRTPath = srtPath
 	result.TextPath = textPath
+	result.AudioFormat = preferred
 	result.Segments = len(subtitle.Normalize(cues))
 	return result, nil
 }
@@ -293,16 +302,13 @@ func (p *chunkPiece) merge(other *chunkPiece) {
 // transcribeSpan extracts one span and sends it. Two failures have a defined
 // remedy: a provider that calls the audio malformed is answered with the next
 // encoding, and a payload that is too large for one request is halved.
-func (j *Job) transcribeSpan(ctx context.Context, path string, span chunk.Span, language string, opts Options, formatIndex *int, report func(Progress), depth int) (*chunkPiece, error) {
+func (j *Job) transcribeSpan(ctx context.Context, path string, span chunk.Span, language string, opts Options, preferred *string, report func(Progress), depth int) (*chunkPiece, error) {
 	speed := opts.speedValue()
-	formats := ffmpeg.AudioFormats()
-	if *formatIndex < 0 || *formatIndex >= len(formats) {
-		*formatIndex = 0
-	}
+	formats := orderedFormats(*preferred)
 
 	var lastErr error
 	var attempted []string
-	for attempt := *formatIndex; attempt < len(formats); attempt++ {
+	for attempt := 0; attempt < len(formats); attempt++ {
 		format := formats[attempt]
 		attempted = append(attempted, format.Name)
 
@@ -319,7 +325,7 @@ func (j *Job) transcribeSpan(ctx context.Context, path string, span chunk.Span, 
 			mid := span.Start + span.Duration()/2
 			piece := &chunkPiece{}
 			for _, half := range []chunk.Span{{Start: span.Start, End: mid}, {Start: mid, End: span.End}} {
-				part, err := j.transcribeSpan(ctx, path, half, language, opts, formatIndex, report, depth+1)
+				part, err := j.transcribeSpan(ctx, path, half, language, opts, preferred, report, depth+1)
 				if err != nil {
 					return nil, err
 				}
@@ -334,7 +340,7 @@ func (j *Job) transcribeSpan(ctx context.Context, path string, span chunk.Span, 
 		})
 		result, err := j.transcribe(ctx, opts.Model, language, audio, format.Name)
 		if err == nil {
-			*formatIndex = attempt
+			*preferred = format.Name
 			return &chunkPiece{
 				texts: []string{result.Text},
 				cues:  cuesFor(result, span, speed),
@@ -363,6 +369,26 @@ func (j *Job) transcribeSpan(ctx context.Context, path string, span chunk.Span, 
 	// and the honest advice is to switch models rather than to retry.
 	return nil, fmt.Errorf("the provider rejected %s audio for %s; try a different transcription model — %w",
 		strings.Join(attempted, ", "), span, lastErr)
+}
+
+// orderedFormats puts the container that worked last time in front. Preference
+// is only a hint: the rest of the ladder stays behind it, so a model that
+// changes behaviour or a file that needs another encoding still succeeds.
+func orderedFormats(first string) []ffmpeg.AudioFormat {
+	formats := ffmpeg.AudioFormats()
+	if first == "" {
+		return formats
+	}
+	for i, format := range formats {
+		if format.Name != first || i == 0 {
+			continue
+		}
+		ordered := make([]ffmpeg.AudioFormat, 0, len(formats))
+		ordered = append(ordered, format)
+		ordered = append(ordered, formats[:i]...)
+		return append(ordered, formats[i+1:]...)
+	}
+	return formats
 }
 
 // rejectsAudio reports whether the provider refused the audio itself, which is

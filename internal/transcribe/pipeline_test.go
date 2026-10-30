@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"cloudtranscribe/internal/chunk"
+	"cloudtranscribe/internal/ffmpeg"
 	"cloudtranscribe/internal/openrouter"
 	"cloudtranscribe/internal/subtitle"
 )
@@ -258,4 +259,39 @@ func messageOf(body string) string {
 		panic(err)
 	}
 	return payload.Error.Message
+}
+
+// A remembered container goes first but must not shrink the ladder: a model
+// that changes behaviour still gets the other encodings.
+func TestOrderedFormatsPrefersTheRememberedContainer(t *testing.T) {
+	defaults := ffmpeg.AudioFormats()
+	if got := orderedFormats(""); len(got) != len(defaults) || got[0].Name != defaults[0].Name {
+		t.Fatalf("no preference should keep the default order, got %v", names(got))
+	}
+
+	got := orderedFormats("pcm16")
+	if len(got) != len(defaults) {
+		t.Fatalf("preference dropped formats: %v", names(got))
+	}
+	if got[0].Name != "pcm16" {
+		t.Errorf("first format is %q, want pcm16", got[0].Name)
+	}
+	// The order behind the preference is unchanged, so a rejection still walks
+	// the ladder in the documented order.
+	want := append([]string{"pcm16"}, names(ffmpeg.AudioFormats()[:len(defaults)-1])...)
+	if strings.Join(names(got), ",") != strings.Join(want, ",") {
+		t.Errorf("order = %v, want %v", names(got), want)
+	}
+
+	if unknown := orderedFormats("nonsense"); names(unknown)[0] != defaults[0].Name {
+		t.Errorf("unknown preference changed the order: %v", names(unknown))
+	}
+}
+
+func names(formats []ffmpeg.AudioFormat) []string {
+	out := make([]string, len(formats))
+	for i, f := range formats {
+		out[i] = f.Name
+	}
+	return out
 }

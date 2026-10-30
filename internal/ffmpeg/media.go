@@ -181,18 +181,19 @@ type AudioFormat struct {
 // AudioFormats lists the encodings to offer the API, in the order they are
 // tried. Every one is mono, 16 kHz, which is what speech models expect.
 //
-// FLAC comes first: it is lossless and decodable by every provider audio stack
-// (it is what Python's soundfile, ffmpeg and the Riva containers all handle), so
-// it is the least likely to be called "malformed audio". MP3 follows because
-// some gateways accept nothing else and it keeps uploads smaller, and WAV is
-// the universal third try. Raw 16-bit PCM comes last because that is what
-// Riva-based backends (NVIDIA's among them) decode most directly, and it costs
-// nothing unless the three containers were refused.
+// WAV comes first. It is what OpenRouter's own docs call "the safest default",
+// it needs no decoder beyond a RIFF header, and it is the format the provider
+// behind most speech-to-text endpoints documents. MP3 follows: smaller over the
+// wire and accepted nearly everywhere, but every provider bundles a different
+// decoder. FLAC is lossless and compact yet less universally accepted, and raw
+// PCM16 comes last because only Riva-style backends take it. OpenRouter exposes
+// no per-model list of accepted containers, so the order is a guess and every
+// rejection is answered by the next entry.
 func AudioFormats() []AudioFormat {
 	return []AudioFormat{
-		{Name: "flac", Ext: "flac", Args: []string{"-c:a", "flac", "-compression_level", "8", "-f", "flac"}},
-		{Name: "mp3", Ext: "mp3", Args: []string{"-c:a", "libmp3lame", "-b:a", "64k", "-f", "mp3"}},
 		{Name: "wav", Ext: "wav", Args: []string{"-c:a", "pcm_s16le", "-f", "wav"}},
+		{Name: "mp3", Ext: "mp3", Args: []string{"-c:a", "libmp3lame", "-b:a", "64k", "-f", "mp3"}},
+		{Name: "flac", Ext: "flac", Args: []string{"-c:a", "flac", "-compression_level", "8", "-f", "flac"}},
 		{Name: "pcm16", Ext: "pcm", Args: []string{"-c:a", "pcm_s16le", "-f", "s16le"}},
 	}
 }
